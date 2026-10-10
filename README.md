@@ -1,5 +1,7 @@
 # Developer Portfolio — AWS deployment
 
+GitHub repository: `SatyamMauryakit/Replit_porject`.
+
 This repository currently contains a React/Vite developer portfolio and a small
 Express API. These deployment files adapt the attached AWS workflow brief to
 the code that is actually in this workspace.
@@ -24,10 +26,9 @@ the code that is actually in this workspace.
   web container. The deployment script keeps two Compose slots so it can
   health-check a new version before changing Nginx.
 
-The Replit project currently has an internal backup Git remote, not a connected
-GitHub repository. The AWS pipeline is prepared but is **not live** until a
-private GitHub repository, Docker Hub, an EC2 host, and their settings are
-configured.
+The GitHub repository is the deployment source, and the Replit backup remote is
+left intact. The AWS pipeline is prepared but is **not live** until Docker Hub,
+an EC2 host, and the required GitHub settings are configured.
 
 ## Deployment architecture
 
@@ -39,7 +40,7 @@ flowchart LR
     Dev[Developer edits in Replit] -->|Stage, commit, push| GitHub[Private GitHub repository]
     GitHub -->|Push to main or manual run on main| Actions[GitHub Actions]
     Actions --> Checks[Install locked dependencies, lint/tests if present, typecheck, build]
-    Checks -->|Only after success| Images[Build immutable SHA-tagged API and web images]
+    Checks -->|Only after success| Images[Build commit-SHA-tagged API and web images]
     Images -->|Push| Hub[Docker Hub]
     Actions -->|SSH with pinned host key| DeployUser[Restricted EC2 deploy user]
     DeployUser -->|sudo allowlisted deploy script| Script[Blue/green deployment script]
@@ -60,7 +61,7 @@ flowchart LR
 | `deploy/Dockerfile.api` | Builds the Express server in a Node build stage, then runs its bundled output as the non-root `node` user. |
 | `deploy/nginx/container.conf` | Serves the SPA, supports client-side routes, and proxies `/api/*` to Express over Docker's private network. |
 | `compose.yaml` | Defines the API and web containers, health checks, restart policy, and a loopback-only web port. It can also build locally. |
-| `.github/workflows/deploy.yml` | On pushes to `main`, validates the workspace, publishes two images tagged with the exact commit SHA, then deploys that SHA. It also supports manual runs; production jobs only run when the selected ref is `main`. |
+| `.github/workflows/deploy.yml` | Pull requests to `main` run workspace checks and Docker image builds without publishing or deploying. Pushes to `main` and manual runs on `main` publish commit-SHA-tagged images and deploy that SHA. |
 | `deploy/deploy.sh` | Runs on EC2. It updates the inactive Compose slot, checks the site and API, switches the host Nginx upstream only after checks pass, and retains the previous slot for rollback. |
 | `deploy/nginx/developer-portfolio.conf` | Host-level Nginx reverse proxy. Replace the example hostname before enabling HTTPS. |
 | `deploy/nginx/developer-portfolio-upstream.conf` | Initial host Nginx target. The deployment script changes this include atomically between ports 18080 and 18081. |
@@ -69,24 +70,20 @@ flowchart LR
 
 ## GitHub and Replit source workflow
 
+The GitHub connection is attached to this Replit project, and the selected
+repository is `SatyamMauryakit/Replit_porject`. Confirm its visibility is
+Private in GitHub. The repository's existing `main` history is preserved; the
+deployment setup is being prepared on a separate branch for review.
+
 Replit autosaves editor changes, but its Git integration does **not** push every
-edit automatically. You stage and commit changes in the Git pane, then push
-those commits to GitHub. GitHub Actions cannot deploy edits that have not been
-pushed.
+edit automatically. Stage, commit, and push changes. Pull requests to `main`
+run checks and build both Docker images but do not publish or deploy. Merging to
+`main` starts image publishing and the EC2 deployment, so configure all
+repository variables and secrets before merging.
 
-1. Connect this Replit project to a **private** GitHub repository using the
-   Replit Git pane. Preserve the current project history when connecting; do not
-   replace the existing `.git` directory.
-2. Confirm the repository's deployment branch is named `main`.
-3. Stage and commit the files in this project, then push `main` to GitHub.
-4. Confirm the commit and the new deployment files appear in the private
-   repository before enabling Actions.
-5. Make later edits in Replit, then explicitly stage, commit, and push them.
-   A push to `main` starts the CI/CD workflow.
-
-If you push the workflow before configuring its repository settings, validation
-can still run, but image publishing and EC2 deployment will stop at their
-missing-setting checks.
+If the workflow reaches `main` before its repository settings are configured,
+validation can still run, but image publishing and EC2 deployment will stop at
+their missing-setting checks.
 
 ## GitHub repository settings
 
