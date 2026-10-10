@@ -1,152 +1,63 @@
-# Developer Portfolio — Docker and CI
+# Developer Portfolio deployment (simple EC2 + Docker Compose)
 
-GitHub repository: `SatyamMauryakit/Replit_porject`.
+Repository: `SatyamMauryakit/Replit_porject`
 
-This repository contains a React/Vite developer portfolio and a small Express
-health API. It uses pnpm workspaces, Node.js 24, and separate production
-containers for the static frontend and API.
+This project is a pnpm workspace generated for Replit and contains:
+- a frontend (`artifacts/dev-portfolio`) built with Vite/React
+- an API (`artifacts/api-server`) built with Express
+- Docker deployment files that run both services behind Nginx
 
-## What is in this repository
+The deployment model in this repo is now intentionally simple:
+- **No dedicated deploy Linux user is required**
+- **No Docker Hub publishing is required**
+- **No blue/green slot switching is used**
+- EC2 runs the app directly with `docker compose up --build`
 
-- **Frontend:** React, Vite, TypeScript, Tailwind CSS, in
-  `artifacts/dev-portfolio/`.
-- **API:** Node.js and Express 5, in `artifacts/api-server/`. At present it
-  provides `/api/healthz`; the portfolio content itself is editable frontend
-  sample data, not a MongoDB-backed CMS.
-- **Workspace:** pnpm 10.26.1 lockfile and pnpm monorepo.
-- **Production topology:** separate web and API containers. The web container
-  serves the built single-page app and forwards `/api/*` to the API container.
-- **AWS edge:** host Nginx listens on ports 80/443 and forwards to the active
-  web container. The deployment script keeps two Compose slots so it can
-  health-check a new version before changing Nginx.
+---
 
-The GitHub remote is configured and the Replit backup remote is retained. This
-checkout is on `aws/deployment-setup`; `main` is the CI target branch. Replit's
-Git pane supports Auto-sync, while the CI workflow only runs for changes that
-have been committed and pushed to GitHub.
+## Repository files used for deployment
 
-The CI-only workflow in `.github/workflows/ci.yml` checks pushes and pull
-requests to `main` and supports manual runs. It installs locked dependencies,
-runs available checks, typechecks and builds the workspace, and builds both
-production containers without publishing or deploying.
-
-The separate, pre-existing `.github/workflows/deploy.yml` can publish Docker Hub
-images and deploy to AWS when its settings are configured. This CI workflow does
-not invoke it. Disable that existing workflow in GitHub if you do not want
-pushes to `main` to publish or deploy.
-
-## Deployment architecture
-
-See [`deploy/architecture.mmd`](deploy/architecture.mmd) for the Mermaid
-diagram.
-
-```mermaid
-flowchart LR
-    Dev[Developer edits in Replit] -->|Stage, commit, push| GitHub[Private GitHub repository]
-    GitHub -->|Push to main or manual run on main| Actions[GitHub Actions]
-    Actions --> Checks[Install locked dependencies, lint/tests if present, typecheck, build]
-    Checks -->|Only after success| Images[Build commit-SHA-tagged API and web images]
-    Images -->|Push| Hub[Docker Hub]
-    Actions -->|SSH with pinned host key| DeployUser[Restricted EC2 deploy user]
-    DeployUser -->|sudo allowlisted deploy script| Script[Blue/green deployment script]
-    Hub -->|Pull exact commit SHA| Script
-    Script -->|Start and health-check inactive slot| Compose[Docker Compose on private network]
-    Compose --> Web[Unprivileged Nginx container, port 8080]
-    Compose --> API[Express API container, port 5000]
-    HostNginx[Host Nginx, HTTP/HTTPS 80/443] -->|Active slot 18080 or 18081| Web
-    Web -->|/api/*| API
-    Script -->|Switch upstream only after healthy checks| HostNginx
-```
-
-## What each deployment file does
-
-| File | Purpose and when it runs |
+| File | Purpose |
 | --- | --- |
-| `deploy/Dockerfile.frontend` | Installs the locked workspace dependencies, builds the Vite site, and copies only the static output into an unprivileged Nginx image. |
-| `deploy/Dockerfile.api` | Builds the Express server in a Node build stage, then runs its bundled output as the non-root `node` user. |
-| `deploy/nginx/container.conf` | Serves the SPA, supports client-side routes, and proxies `/api/*` to Express over Docker's private network. |
-| `compose.yaml` | Defines the API and web containers, health checks, restart policy, and a loopback-only web port. It can also build locally. |
-| `.github/workflows/ci.yml` | CI-only checks and builds on pushes and pull requests to `main`, plus manual runs. It never publishes images or deploys. |
-| `.github/workflows/deploy.yml` | Separate existing AWS workflow. When configured, it can publish Docker Hub images and deploy on `main`. |
-| `deploy/deploy.sh` | Runs on EC2. It updates the inactive Compose slot, checks the site and API, switches the host Nginx upstream only after checks pass, and retains the previous slot for rollback. |
-| `deploy/nginx/developer-portfolio.conf` | Host-level Nginx reverse proxy. Replace the example hostname before enabling HTTPS. |
-| `deploy/nginx/developer-portfolio-upstream.conf` | Initial host Nginx target. The deployment script changes this include atomically between ports 18080 and 18081. |
-| `.env.example` | Safe, non-secret defaults for local Compose builds. It is not used by the EC2 deploy script. |
-| `.dockerignore` | Keeps Git metadata, dependencies, secrets, generated files, and uploaded prompt files out of Docker build contexts. |
+| `compose.yaml` | Defines `api` and `web` services; only web is bound to `127.0.0.1:18080`; API stays internal. |
+| `deploy/Dockerfile.api` | Production build/runtime image for Express API. |
+| `deploy/Dockerfile.frontend` | Production build/runtime image for frontend Nginx container. |
+| `deploy/nginx/container.conf` | In-container Nginx config: SPA fallback + `/api/*` proxy to `api:5000`. |
+| `deploy/nginx/developer-portfolio.conf` | Host Nginx virtual host for public `80/443`, proxies to localhost compose web port. |
+| `deploy/nginx/developer-portfolio-upstream.conf` | Host Nginx snippet pointing to `http://127.0.0.1:18080`. |
+| `deploy/deploy.sh` | Simple helper for compose deploy/start/stop/log/health commands using current EC2 user. |
+| `.github/workflows/ci.yml` | CI checks/build for PRs/pushes to `main` (no deployment). |
+| `.github/workflows/deploy.yml` | Optional manual workflow to copy repo to EC2 and run compose deploy over SSH. |
 
-## GitHub and Replit source workflow
+---
 
-The remote points to `SatyamMauryakit/Replit_porject`; confirm the repository is
-Private in GitHub. The existing `main` history is preserved, and this checkout
-is on `aws/deployment-setup` for review.
+## Runtime architecture
 
-To use Replit's supported synchronization option, open the **Git** pane in the
-Project Editor and enable **Auto-sync**. Editor saves alone are not Git commits.
-If Auto-sync is off or unavailable, stage and commit changes in the Git pane,
-then push the branch. Open a pull request targeting `main` to run CI before
-merging. GitHub Actions cannot see local Replit changes until they are pushed.
+1. Host Nginx listens on public ports **80/443**.
+2. Host Nginx forwards traffic to `127.0.0.1:18080`.
+3. Docker Compose `web` container serves the SPA and proxies `/api/*` to `api:5000` on Docker network.
+4. API container is **not publicly exposed**.
 
-## GitHub repository settings
+This keeps only host Nginx public and preserves SPA routes + API proxy behavior.
 
-In the private repository, open **Settings → Secrets and variables → Actions**.
-Add these **repository variables**:
+---
 
-| Variable | Example / meaning |
-| --- | --- |
-| `DOCKERHUB_IMAGE` | Docker Hub namespace and base repository, such as `myaccount/developer-portfolio`. The workflow adds `-api` and `-web` to create the two image names. |
-| `EC2_HOST` | EC2 Elastic IP address or public DNS name. |
-| `EC2_USER` | The dedicated deployment login, normally `deploy`. |
+## EC2 setup (Ubuntu, existing default user)
 
-Add these **repository secrets**:
+> Use your normal EC2 login user (typically `ubuntu`). Do not create a separate deploy user.
 
-| Secret | Meaning |
-| --- | --- |
-| `DOCKERHUB_USERNAME` | Docker Hub account or robot-account username with permission to push. |
-| `DOCKERHUB_TOKEN` | Docker Hub access token with the minimum permissions needed to publish images. |
-| `EC2_SSH_PRIVATE_KEY` | Private half of the dedicated deploy user's SSH key. Never commit or paste it into chat. |
-| `EC2_SSH_KNOWN_HOSTS` | The verified EC2 SSH host-key line(s), obtained and checked out-of-band. |
+### 1) Security group
 
-For a private Docker Hub repository, the EC2 host also needs a **read-only**
-Docker Hub token for image pulls. Log in on EC2 as root using `docker login
---password-stdin`; Docker stores the credential in root's protected Docker
-configuration. Do not put the pull token in this repository or in the image.
-If the images are public, EC2 does not need this login.
+Allow inbound:
+- TCP `80` from internet
+- TCP `443` from internet
+- TCP `22` only from your trusted admin/deployment source
 
-### SSH key and host verification
+Do **not** open `5000` or `18080` publicly.
 
-Generate a dedicated key on a trusted local machine:
+### 2) Install Docker and Nginx
 
-```sh
-ssh-keygen -t ed25519 -f github-actions-deploy -C github-actions-deploy -N ''
-```
-
-Install `github-actions-deploy.pub` in the EC2 `deploy` user's
-`~/.ssh/authorized_keys`. Save the private key as the GitHub
-`EC2_SSH_PRIVATE_KEY` secret.
-
-Obtain the EC2 SSH host key, then verify its fingerprint using an independent
-trusted channel before saving its known-hosts line(s) as
-`EC2_SSH_KNOWN_HOSTS`. `ssh-keyscan` can collect a key, but does not prove the
-key belongs to your instance by itself. The workflow enforces strict host-key
-checking and does not disable SSH verification.
-
-GitHub-hosted runner IP ranges change. Do not open SSH to `0.0.0.0/0`. Allow
-SSH only from a maintained GitHub Actions runner IP allowlist, use a
-GitHub-hosted larger runner with a static IP where available, or use a
-self-hosted runner / AWS Systems Manager design with private network access.
-Keep web ports 80 and 443 public; restrict SSH to the deployment path you
-choose.
-
-## Prepare an Ubuntu EC2 host
-
-Use an Ubuntu 24.04 LTS **x86_64/amd64** instance for the provided image build
-target. Assign an Elastic IP if you need a stable DNS destination. In the EC2
-security group, allow inbound TCP 80 and 443 from the internet. Restrict TCP 22
-as described above. Do not open container ports 5000, 18080, or 18081 publicly.
-
-Install Docker Engine, Compose, Nginx, and Certbot on the instance:
-
-```sh
+```bash
 sudo apt-get update
 sudo apt-get install -y ca-certificates curl gnupg nginx certbot python3-certbot-nginx
 
@@ -166,47 +77,34 @@ printf '%s\n' \
 
 sudo apt-get update
 sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
 sudo systemctl enable --now docker
 sudo systemctl enable --now nginx
 ```
 
-Create the restricted deployment account. Do **not** add it to the `docker`
-group; membership in that group is effectively root access. The only password-
-less sudo permission granted below is the root-owned deployment script, which
-validates the SHA and Docker Hub image arguments.
-
-```sh
-sudo adduser --disabled-password --gecos '' deploy
-sudo install -d -o deploy -g deploy -m 0700 /home/deploy/.ssh
-sudo install -o deploy -g deploy -m 0600 /dev/null /home/deploy/.ssh/authorized_keys
-sudoedit /home/deploy/.ssh/authorized_keys
+Optional (to run Docker without `sudo`):
+```bash
+sudo usermod -aG docker "$USER"
+# re-login for group change to apply
 ```
 
-Paste the public key for the dedicated Actions key into `authorized_keys`, one
-line, then check its ownership and permissions:
+### 3) Copy or clone this repository on EC2
 
-```sh
-sudo chown deploy:deploy /home/deploy/.ssh/authorized_keys
-sudo chmod 0600 /home/deploy/.ssh/authorized_keys
+Example path:
+```bash
+mkdir -p ~/developer-portfolio
+cd ~/developer-portfolio
+# either git clone, or copy files from your machine/CI
 ```
 
-From a trusted clone of this repository on the instance, or by securely
-transferring the files to it, install the Compose file and deployment script.
-The GitHub workflow publishes and deploys application images; it does not copy
-or replace these root-owned EC2 control files.
+### 4) Install host Nginx site config
 
-```sh
-sudo install -d -o root -g root -m 0755 /opt/developer-portfolio
-sudo install -o root -g root -m 0644 compose.yaml /opt/developer-portfolio/compose.yaml
-sudo install -o root -g root -m 0755 deploy/deploy.sh /usr/local/sbin/developer-portfolio-deploy
-sudo install -d -o root -g root -m 0755 /var/lib/developer-portfolio
-```
+Edit `deploy/nginx/developer-portfolio.conf` and replace:
+- `server_name your-domain.example;`
 
-Install the host Nginx site and initial upstream include. First edit
-`deploy/nginx/developer-portfolio.conf` to use your real domain; preserve any
-existing Nginx sites on the instance.
+Then install config:
 
-```sh
+```bash
 sudo install -d -o root -g root -m 0755 /etc/nginx/snippets
 sudo install -o root -g root -m 0644 \
   deploy/nginx/developer-portfolio-upstream.conf \
@@ -214,195 +112,109 @@ sudo install -o root -g root -m 0644 \
 sudo install -o root -g root -m 0644 \
   deploy/nginx/developer-portfolio.conf \
   /etc/nginx/sites-available/developer-portfolio
-sudo ln -s /etc/nginx/sites-available/developer-portfolio \
-  /etc/nginx/sites-enabled/developer-portfolio
-```
+sudo ln -s /etc/nginx/sites-available/developer-portfolio /etc/nginx/sites-enabled/developer-portfolio
 
-If the symlink already exists, inspect it rather than replacing it. Test the
-complete Nginx configuration before reloading:
-
-```sh
 sudo nginx -t
 sudo systemctl reload nginx
 ```
 
-Grant the deploy account permission to run only the validating release script:
+If the symlink already exists, keep it and only update/test/reload.
 
-```sh
-printf '%s\n' \
-  'deploy ALL=(root) NOPASSWD: /usr/local/sbin/developer-portfolio-deploy *' \
-  | sudo tee /etc/sudoers.d/developer-portfolio-deploy >/dev/null
-sudo chmod 0440 /etc/sudoers.d/developer-portfolio-deploy
-sudo visudo -cf /etc/sudoers.d/developer-portfolio-deploy
+### 5) Deploy with Docker Compose
+
+From repo root:
+
+```bash
+chmod +x deploy/deploy.sh
+./deploy/deploy.sh deploy
 ```
 
-For private Docker Hub images, perform the login on EC2 without putting the
-token in shell history:
+The script will:
+- run `docker compose up --build -d --wait`
+- keep API internal
+- verify health via `http://127.0.0.1:18080/` and `/api/healthz`
 
-```sh
-read -r -p 'Docker Hub username: ' DOCKERHUB_USERNAME
-read -r -s -p 'Read-only Docker Hub token: ' DOCKERHUB_PULL_TOKEN
-printf '\n'
-printf '%s' "$DOCKERHUB_PULL_TOKEN" \
-  | sudo docker login --username "$DOCKERHUB_USERNAME" --password-stdin
-unset DOCKERHUB_USERNAME DOCKERHUB_PULL_TOKEN
-sudo chmod 0600 /root/.docker/config.json
+---
+
+## Day-2 operations on EC2
+
+From repository root:
+
+```bash
+./deploy/deploy.sh status          # container status
+./deploy/deploy.sh logs            # recent logs
+./deploy/deploy.sh logs web        # logs for one service
+./deploy/deploy.sh health          # local health checks
+./deploy/deploy.sh restart         # restart without rebuild
+./deploy/deploy.sh down            # stop containers
+./deploy/deploy.sh deploy          # rebuild + restart
 ```
 
-## Domain and HTTPS
+Equivalent raw compose commands:
 
-1. Point the domain's DNS A record to the EC2 Elastic IP. Add an AAAA record
-   only if IPv6 is configured on the instance and security group.
-2. Replace `your-domain.example` in the host Nginx configuration and reload
-   after `sudo nginx -t` succeeds.
-3. Once public DNS resolves to the instance and ports 80/443 are reachable,
-   request a certificate:
-
-   ```sh
-   sudo certbot --nginx -d your-real-domain.example --redirect
-   sudo certbot renew --dry-run
-   ```
-
-Certbot updates the host Nginx site to handle HTTPS and redirect HTTP. The host
-Nginx process is separate from the Docker Compose application and remains
-running when a portfolio release changes.
-
-## First deployment and verification
-
-The GitHub Actions workflow deploys an image only after checks pass and both
-commit-SHA-tagged images have been pushed. On the first release, the script starts the
-blue slot, checks `/` and `/api/healthz`, then points host Nginx to port 18080.
-Later deployments use the other slot (18081), and only switch traffic after
-the candidate is healthy.
-
-After the first Actions run, verify from EC2:
-
-```sh
-sudo docker compose \
-  --project-name developer-portfolio-blue \
-  --file /opt/developer-portfolio/compose.yaml ps
-sudo cat /var/lib/developer-portfolio/active-slot
-sudo tail -n 50 /var/log/developer-portfolio-deploy.log
-curl --fail --show-error http://127.0.0.1:18080/
-curl --fail --show-error http://127.0.0.1:18080/api/healthz
+```bash
+docker compose up --build -d --wait
+docker compose ps
+docker compose logs --tail=100
+docker compose down
 ```
 
-Use the actual active port (18080 or 18081) for the `curl` checks. Then visit
-the real domain over HTTPS.
+---
 
-To roll back to the previous healthy slot:
+## Optional domain + HTTPS
 
-```sh
-sudo /usr/local/sbin/developer-portfolio-deploy rollback \
-  your-dockerhub-namespace/developer-portfolio
+After DNS points to EC2 and port 80 is reachable:
+
+```bash
+sudo certbot --nginx -d your-real-domain.example --redirect
+sudo certbot renew --dry-run
 ```
 
-The script checks the previous slot before switching host Nginx. It retains the
-current and previous SHA-tagged images and removes only older 40-character
-SHA-tags for this app, without force-removing images still in use. Both slots
-remain running to keep rollback quick; account for that resource use on a small
-EC2 instance.
+---
 
-## Local validation
+## GitHub Actions workflows
 
-Run from the repository root:
+### CI (`.github/workflows/ci.yml`)
+- Runs on `push`/`pull_request` to `main`
+- Installs workspace deps with locked pnpm lockfile
+- Runs lint/test if present, typecheck, workspace build, compose validation, docker compose build
+- **Does not deploy**
 
-```sh
+### Deploy (`.github/workflows/deploy.yml`)
+- Manual only (`workflow_dispatch`) to avoid duplicate pipelines
+- Copies repository files to EC2 over SSH
+- Runs `deploy/deploy.sh deploy` on EC2 using your existing EC2 login user
+
+If you use this optional workflow, set:
+- repository variable `EC2_HOST`
+- optional repository variable `EC2_USER` (defaults to `ubuntu`)
+- optional repository variable `EC2_APP_DIR` (defaults to `/home/<EC2_USER>/developer-portfolio`)
+- repository secret `EC2_SSH_PRIVATE_KEY`
+
+No Docker Hub credentials are required for this deployment path.
+
+---
+
+## Replit → GitHub → EC2 flow
+
+- Replit editor changes are local until committed/pushed.
+- CI runs when commits reach GitHub `main` or PRs target `main`.
+- To deploy, either:
+  1. SSH to EC2 and run `./deploy/deploy.sh deploy`, or
+  2. Trigger the manual `Deploy portfolio to EC2` workflow in GitHub Actions.
+
+---
+
+## Local validation commands
+
+```bash
 pnpm install --frozen-lockfile
 pnpm -r --if-present run lint
 pnpm -r --if-present run test
 pnpm run typecheck
-PORT=19980 BASE_PATH=/ pnpm --filter @workspace/dev-portfolio run build
-pnpm --filter @workspace/api-server run build
-```
-
-There are currently no lint or test scripts in the workspace, so those
-commands are safe no-ops until such scripts are added. The CI workflow runs
-them when present.
-
-To build and run both containers locally:
-
-```sh
+pnpm run build
 docker compose config --quiet
-docker compose up --build --detach --wait
-curl --fail --show-error http://127.0.0.1:18080/
-curl --fail --show-error http://127.0.0.1:18080/api/healthz
-docker compose logs --follow
-docker compose down
+docker compose build
 ```
 
-Docker Engine with Compose is required (Docker Desktop on Windows/macOS, or
-Docker Engine on Linux). The containers run Linux images and avoid host-specific
-paths; the Node and Nginx images support common `amd64` and `arm64` platforms.
-Local Compose uses safe default image names and needs no Docker Hub login,
-`.env` file, database, or external API credentials. Override the web port with
-`WEB_HOST_PORT`, and image naming with `DOCKERHUB_IMAGE` or `DEPLOY_IMAGE_TAG`.
-
-In Replit, use the managed `artifacts/dev-portfolio: web` workflow for the
-portfolio preview and `artifacts/api-server: API Server` for `/api/healthz`.
-If this is a fresh import, install dependencies using
-`pnpm install --frozen-lockfile`; managed workflows provide the required ports
-and Vite base path.
-
-## Required GitHub Actions settings checklist
-
-- [ ] Private GitHub repository is connected and has a `main` branch.
-- [ ] Docker Hub repositories exist for `<namespace>/<base>-api` and
-  `<namespace>/<base>-web`; the workflow pushes SHA tags.
-- [ ] `DOCKERHUB_IMAGE`, `EC2_HOST`, and `EC2_USER` repository variables are set.
-- [ ] `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` repository secrets are set.
-- [ ] EC2 SSH private-key and verified host-key secrets are set.
-- [ ] EC2 is Ubuntu 24.04 x86_64, has Docker, Compose, host Nginx, and Certbot.
-- [ ] EC2 has the deploy account, authorized public key, root-owned deployment
-  script, Compose file, Nginx site, and restricted sudo rule.
-- [ ] EC2 security group allows 80/443 and restricts SSH to the chosen
-  deployment access path.
-- [ ] For private images, the EC2 root Docker client is authenticated for pulls.
-- [ ] DNS resolves to the EC2 Elastic IP before requesting HTTPS.
-
-## Troubleshooting
-
-| Symptom | Checks |
-| --- | --- |
-| CI stops before building images | Confirm `pnpm install --frozen-lockfile`, typecheck, workspace build, and Docker build logs. A failed check blocks the CI job. |
-| Replit workflow reports `vite` or `esbuild` missing | Run `pnpm install --frozen-lockfile`, then restart the managed workflow. |
-| Docker container is unhealthy | Check `docker compose ps` and `docker compose logs api web`; the web health check uses `/` and the API check uses `/api/healthz`. |
-| A package install returns HTTP 403 | Check the package/version named in the install error. A security-blocked older package may need its parent dependency updated to a version that allows a patched release. |
-| Docker Hub login or push fails | Verify the repository secrets, token write permission, Docker Hub namespace, and both image repositories. |
-| SSH fails in Actions | Verify `EC2_HOST`, `EC2_USER`, the matching public key in `authorized_keys`, the private-key secret, the verified known-hosts secret, and port 22 reachability from the chosen runner network. |
-| `sudo` asks for a password | Check `/etc/sudoers.d/developer-portfolio-deploy` with `visudo -cf`; the remote command must use `sudo -n`. |
-| Image pull fails on EC2 | For private repositories, confirm root's `docker login` works and the token has read access. |
-| Candidate containers are unhealthy | Check `docker compose -p developer-portfolio-blue -f /opt/developer-portfolio/compose.yaml logs` (or `green`) and the deploy log. The active Nginx target is unchanged if health checks fail. |
-| Nginx returns 502 | Check `sudo nginx -t`, the upstream include, the active slot port, and that the web and API containers are healthy. |
-| HTTPS certificate request fails | Confirm DNS A/AAAA records, port 80 ingress, real `server_name`, and that no proxy/CDN is intercepting the ACME challenge. |
-| A Replit edit did not deploy | Stage, commit, and push it to GitHub `main`; editor autosave does not trigger GitHub Actions. |
-
-## Important scope and security notes
-
-- This workflow targets the **portfolio code currently in this repository**.
-  It does not create the unrelated FastAPI/OpenStreetMap application named in
-  the attached brief.
-- Commit-SHA image tags make releases traceable, but Docker Hub does not make
-  tags immutable by name alone. Configure tag immutability in the registry or
-  use digest-pinned releases if you require registry-enforced immutability.
-- The current Express server only provides a health check. The portfolio
-  currently uses local sample data and has no MongoDB-backed editing or saved
-  contact form.
-- No AWS account, EC2 host, GitHub repository, Docker Hub token, SSH key, DNS
-  name, or MongoDB connection was supplied or configured here. The files are
-  deployment-ready scaffolding, not evidence of a live AWS deployment.
-- Do not commit `.env`, private keys, Docker credentials, or other secrets.
-  `EC2_SSH_PRIVATE_KEY` and Docker Hub write access belong in GitHub Secrets.
-- Keep the EC2 SSH ingress restricted. GitHub-hosted runner ranges change; do
-  not solve connectivity by allowing SSH from the whole internet.
-
-## Official references
-
-- [Replit Git interface](https://docs.replit.com/features/workspace-tools/git-interface)
-- [Replit version control](https://docs.replit.com/learn/projects-and-artifacts/version-control)
-- [GitHub Actions workflow syntax](https://docs.github.com/actions/using-workflows/workflow-syntax-for-github-actions)
-- [GitHub Actions secure use](https://docs.github.com/actions/security-for-github-actions/security-guides/security-hardening-for-github-actions)
-- [Docker Engine on Ubuntu](https://docs.docker.com/engine/install/ubuntu/)
-- [Docker Compose](https://docs.docker.com/compose/)
-- [AWS EC2 security groups](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-security-groups.html)
-- [Certbot with Nginx](https://certbot.eff.org/instructions?ws=nginx&os=ubuntufocal)
+Do not commit secrets (`.env`, private keys, cloud credentials).

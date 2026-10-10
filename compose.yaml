@@ -1,6 +1,5 @@
 services:
   api:
-    image: "${DOCKERHUB_IMAGE:-local/developer-portfolio}-api:${DEPLOY_IMAGE_TAG:-dev}"
     build:
       context: .
       dockerfile: deploy/Dockerfile.api
@@ -23,7 +22,6 @@ services:
       retries: 3
 
   web:
-    image: "${DOCKERHUB_IMAGE:-local/developer-portfolio}-web:${DEPLOY_IMAGE_TAG:-dev}"
     build:
       context: .
       dockerfile: deploy/Dockerfile.frontend
