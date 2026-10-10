@@ -1,0 +1,39 @@
+FROM node:24-bookworm-slim AS build
+
+WORKDIR /workspace
+
+RUN corepack enable && corepack prepare pnpm@10.26.1 --activate
+
+# Copy workspace manifests first so dependency installation can be cached
+# independently from application source changes.
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc ./
+COPY artifacts/api-server/package.json artifacts/api-server/package.json
+COPY artifacts/dev-portfolio/package.json artifacts/dev-portfolio/package.json
+COPY artifacts/mockup-sandbox/package.json artifacts/mockup-sandbox/package.json
+COPY lib/api-client-react/package.json lib/api-client-react/package.json
+COPY lib/api-spec/package.json lib/api-spec/package.json
+COPY lib/api-zod/package.json lib/api-zod/package.json
+COPY lib/db/package.json lib/db/package.json
+COPY scripts/package.json scripts/package.json
+
+RUN pnpm install --frozen-lockfile
+
+COPY . .
+
+# The Vite configuration requires the same values supplied by the Replit
+# workflow, even for a production build.
+ENV NODE_ENV=production
+ENV PORT=19980
+ENV BASE_PATH=/
+
+RUN pnpm --filter @workspace/dev-portfolio run build
+
+FROM nginxinc/nginx-unprivileged:1.28-alpine AS runtime
+
+COPY deploy/nginx/container.conf /etc/nginx/conf.d/default.conf
+COPY --from=build /workspace/artifacts/dev-portfolio/dist/public/ /usr/share/nginx/html/
+
+EXPOSE 8080
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
+  CMD wget -q -O /dev/null http://127.0.0.1:8080/ || exit 1
