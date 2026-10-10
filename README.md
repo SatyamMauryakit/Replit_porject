@@ -1,15 +1,10 @@
-# Developer Portfolio — AWS deployment
+# Developer Portfolio — Docker and CI
 
 GitHub repository: `SatyamMauryakit/Replit_porject`.
 
-This repository currently contains a React/Vite developer portfolio and a small
-Express API. These deployment files adapt the attached AWS workflow brief to
-the code that is actually in this workspace.
-
-> The attached brief names a different product, “Pet Friendly Places India,”
-> and specifies FastAPI and OpenStreetMap. Those features and that Python
-> backend are not present here, so this deployment does not add or pretend to
-> deploy them.
+This repository contains a React/Vite developer portfolio and a small Express
+health API. It uses pnpm workspaces, Node.js 24, and separate production
+containers for the static frontend and API.
 
 ## What is in this repository
 
@@ -21,14 +16,24 @@ the code that is actually in this workspace.
 - **Workspace:** pnpm 10.26.1 lockfile and pnpm monorepo.
 - **Production topology:** separate web and API containers. The web container
   serves the built single-page app and forwards `/api/*` to the API container.
-  The API port is not published to the EC2 host.
 - **AWS edge:** host Nginx listens on ports 80/443 and forwards to the active
   web container. The deployment script keeps two Compose slots so it can
   health-check a new version before changing Nginx.
 
-The GitHub repository is the deployment source, and the Replit backup remote is
-left intact. The AWS pipeline is prepared but is **not live** until Docker Hub,
-an EC2 host, and the required GitHub settings are configured.
+The GitHub remote is configured and the Replit backup remote is retained. This
+checkout is on `aws/deployment-setup`; `main` is the CI target branch. Replit's
+Git pane supports Auto-sync, while the CI workflow only runs for changes that
+have been committed and pushed to GitHub.
+
+The CI-only workflow in `.github/workflows/ci.yml` checks pushes and pull
+requests to `main` and supports manual runs. It installs locked dependencies,
+runs available checks, typechecks and builds the workspace, and builds both
+production containers without publishing or deploying.
+
+The separate, pre-existing `.github/workflows/deploy.yml` can publish Docker Hub
+images and deploy to AWS when its settings are configured. This CI workflow does
+not invoke it. Disable that existing workflow in GitHub if you do not want
+pushes to `main` to publish or deploy.
 
 ## Deployment architecture
 
@@ -61,7 +66,8 @@ flowchart LR
 | `deploy/Dockerfile.api` | Builds the Express server in a Node build stage, then runs its bundled output as the non-root `node` user. |
 | `deploy/nginx/container.conf` | Serves the SPA, supports client-side routes, and proxies `/api/*` to Express over Docker's private network. |
 | `compose.yaml` | Defines the API and web containers, health checks, restart policy, and a loopback-only web port. It can also build locally. |
-| `.github/workflows/deploy.yml` | Pull requests to `main` run workspace checks and Docker image builds without publishing or deploying. Pushes to `main` and manual runs on `main` publish commit-SHA-tagged images and deploy that SHA. |
+| `.github/workflows/ci.yml` | CI-only checks and builds on pushes and pull requests to `main`, plus manual runs. It never publishes images or deploys. |
+| `.github/workflows/deploy.yml` | Separate existing AWS workflow. When configured, it can publish Docker Hub images and deploy on `main`. |
 | `deploy/deploy.sh` | Runs on EC2. It updates the inactive Compose slot, checks the site and API, switches the host Nginx upstream only after checks pass, and retains the previous slot for rollback. |
 | `deploy/nginx/developer-portfolio.conf` | Host-level Nginx reverse proxy. Replace the example hostname before enabling HTTPS. |
 | `deploy/nginx/developer-portfolio-upstream.conf` | Initial host Nginx target. The deployment script changes this include atomically between ports 18080 and 18081. |
@@ -70,20 +76,15 @@ flowchart LR
 
 ## GitHub and Replit source workflow
 
-The GitHub connection is attached to this Replit project, and the selected
-repository is `SatyamMauryakit/Replit_porject`. Confirm its visibility is
-Private in GitHub. The repository's existing `main` history is preserved; the
-deployment setup is being prepared on a separate branch for review.
+The remote points to `SatyamMauryakit/Replit_porject`; confirm the repository is
+Private in GitHub. The existing `main` history is preserved, and this checkout
+is on `aws/deployment-setup` for review.
 
-Replit autosaves editor changes, but its Git integration does **not** push every
-edit automatically. Stage, commit, and push changes. Pull requests to `main`
-run checks and build both Docker images but do not publish or deploy. Merging to
-`main` starts image publishing and the EC2 deployment, so configure all
-repository variables and secrets before merging.
-
-If the workflow reaches `main` before its repository settings are configured,
-validation can still run, but image publishing and EC2 deployment will stop at
-their missing-setting checks.
+To use Replit's supported synchronization option, open the **Git** pane in the
+Project Editor and enable **Auto-sync**. Editor saves alone are not Git commits.
+If Auto-sync is off or unavailable, stage and commit changes in the Git pane,
+then push the branch. Open a pull request targeting `main` to run CI before
+merging. GitHub Actions cannot see local Replit changes until they are pushed.
 
 ## GitHub repository settings
 
@@ -322,13 +323,26 @@ them when present.
 To build and run both containers locally:
 
 ```sh
-docker compose --env-file .env.example config --quiet
-docker compose --env-file .env.example build
-docker compose --env-file .env.example up --detach --wait
+docker compose config --quiet
+docker compose up --build --detach --wait
 curl --fail --show-error http://127.0.0.1:18080/
 curl --fail --show-error http://127.0.0.1:18080/api/healthz
-docker compose --env-file .env.example down
+docker compose logs --follow
+docker compose down
 ```
+
+Docker Engine with Compose is required (Docker Desktop on Windows/macOS, or
+Docker Engine on Linux). The containers run Linux images and avoid host-specific
+paths; the Node and Nginx images support common `amd64` and `arm64` platforms.
+Local Compose uses safe default image names and needs no Docker Hub login,
+`.env` file, database, or external API credentials. Override the web port with
+`WEB_HOST_PORT`, and image naming with `DOCKERHUB_IMAGE` or `DEPLOY_IMAGE_TAG`.
+
+In Replit, use the managed `artifacts/dev-portfolio: web` workflow for the
+portfolio preview and `artifacts/api-server: API Server` for `/api/healthz`.
+If this is a fresh import, install dependencies using
+`pnpm install --frozen-lockfile`; managed workflows provide the required ports
+and Vite base path.
 
 ## Required GitHub Actions settings checklist
 
@@ -350,7 +364,10 @@ docker compose --env-file .env.example down
 
 | Symptom | Checks |
 | --- | --- |
-| Workflow stops before building images | Confirm `pnpm install --frozen-lockfile`, typecheck, frontend build, and API build logs. A failed check prevents publishing and deployment. |
+| CI stops before building images | Confirm `pnpm install --frozen-lockfile`, typecheck, workspace build, and Docker build logs. A failed check blocks the CI job. |
+| Replit workflow reports `vite` or `esbuild` missing | Run `pnpm install --frozen-lockfile`, then restart the managed workflow. |
+| Docker container is unhealthy | Check `docker compose ps` and `docker compose logs api web`; the web health check uses `/` and the API check uses `/api/healthz`. |
+| A package install returns HTTP 403 | Check the package/version named in the install error. A security-blocked older package may need its parent dependency updated to a version that allows a patched release. |
 | Docker Hub login or push fails | Verify the repository secrets, token write permission, Docker Hub namespace, and both image repositories. |
 | SSH fails in Actions | Verify `EC2_HOST`, `EC2_USER`, the matching public key in `authorized_keys`, the private-key secret, the verified known-hosts secret, and port 22 reachability from the chosen runner network. |
 | `sudo` asks for a password | Check `/etc/sudoers.d/developer-portfolio-deploy` with `visudo -cf`; the remote command must use `sudo -n`. |

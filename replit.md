@@ -1,45 +1,28 @@
-# [Project name]
+# Developer Portfolio
 
-_Replace the heading above with the project's name, and this line with one sentence describing what this app does for users._
+React/Vite developer portfolio with a small Express health API.
 
 ## Run & Operate
 
-- `pnpm --filter @workspace/api-server run dev` — run the API server (port 5000)
-- `pnpm run typecheck` — full typecheck across all packages
-- `pnpm run build` — typecheck + build all packages
-- `pnpm --filter @workspace/api-spec run codegen` — regenerate API hooks and Zod schemas from the OpenAPI spec
-- `pnpm --filter @workspace/db run push` — push DB schema changes (dev only)
-- Required env: `DATABASE_URL` — Postgres connection string
+- The `artifacts/dev-portfolio: web` workflow serves the portfolio preview.
+- The `artifacts/api-server: API Server` workflow serves `/api/healthz`.
+- Install dependencies on a fresh import with `pnpm install --frozen-lockfile`.
+- `pnpm run typecheck` checks the workspace.
+- `pnpm run build` typechecks and builds workspace packages. The frontend build requires `PORT=19980 BASE_PATH=/`.
+- Run production containers with `docker compose up --build --detach --wait`; open `http://localhost:18080`.
+- `docker compose logs --follow` views container logs; `docker compose down` stops and removes them.
+- The Replit workflows supply `PORT` and `BASE_PATH`. No database or external credentials are required for the current portfolio/API health endpoint.
 
 ## Stack
 
-- pnpm workspaces, Node.js 24, TypeScript 5.9
+- Node.js 24, pnpm 10.26.1, TypeScript 5.9
+- Frontend: React, Vite, Tailwind CSS
 - API: Express 5
-- DB: PostgreSQL + Drizzle ORM
-- Validation: Zod (`zod/v4`), `drizzle-zod`
-- API codegen: Orval (from OpenAPI spec)
-- Build: esbuild (CJS bundle)
+- Production containers: Nginx frontend and Node API, built from multi-stage Dockerfiles under `deploy/`
 
-## Where things live
+## GitHub
 
-_Populate as you build — short repo map plus pointers to the source-of-truth file for DB schema, API contracts, theme files, etc._
-
-## Architecture decisions
-
-_Populate as you build — non-obvious choices a reader couldn't infer from the code (3-5 bullets)._
-
-## Product
-
-_Describe the high-level user-facing capabilities of this app once they exist._
-
-## User preferences
-
-_Populate as you build — explicit user instructions worth remembering across sessions._
-
-## Gotchas
-
-_Populate as you build — sharp edges, "always run X before Y" rules._
-
-## Pointers
-
-- See the `pnpm-workspace` skill for workspace structure, TypeScript setup, and package details
+- GitHub remote: `SatyamMauryakit/Replit_porject`; current working branch: `aws/deployment-setup`; target branch: `main`.
+- `.github/workflows/ci.yml` validates and builds changes on `main` pushes, pull requests to `main`, and manual dispatch. It does not publish or deploy.
+- Replit's Git pane supports Auto-sync; editor saves themselves are not Git commits. If Auto-sync is not enabled, stage, commit, and push in the Git pane.
+- `.github/workflows/deploy.yml` is a separate pre-existing workflow that can publish Docker Hub images and deploy to AWS when configured. It is outside the CI-only workflow.
