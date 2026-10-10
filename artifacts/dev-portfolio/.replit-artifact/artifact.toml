@@ -1,0 +1,28 @@
+kind = "web"
+previewPath = "/"
+title = "Developer Portfolio"
+description = "A responsive personal portfolio website for showcasing projects, skills, experience, and contact information, with modern motion and interactive 3D details."
+version = "1.0.0"
+id = "artifacts/dev-portfolio"
+router = "path"
+
+[[services]]
+name = "web"
+paths = [ "/" ]
+localPort = 19980
+
+[services.development]
+run = "pnpm --filter @workspace/dev-portfolio run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/dev-portfolio", "run", "build" ]
+serve = "static"
+publicDir = "artifacts/dev-portfolio/dist/public"
+
+[[services.production.rewrites]]
+from = "/*"
+to = "/index.html"
+
+[services.env]
+PORT = "19980"
+BASE_PATH = "/"
