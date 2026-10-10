@@ -1,15 +1,10 @@
 flowchart LR
-    Dev[Developer edits in Replit] -->|Stage, commit, push| GitHub[Private GitHub repository]
-    GitHub -->|Push to main or manual run on main| Actions[GitHub Actions]
-    Actions --> Checks[Install locked dependencies, lint/tests if present, typecheck, build]
-    Checks -->|Only after success| Images[Build immutable SHA-tagged API and web images]
-    Images -->|Push| Hub[Docker Hub]
-    Actions -->|SSH with pinned host key| DeployUser[Restricted EC2 deploy user]
-    DeployUser -->|sudo allowlisted deploy script| Script[Blue/green deployment script]
-    Hub -->|Pull exact commit SHA| Script
-    Script -->|Start and health-check inactive slot| Compose[Docker Compose on private network]
-    Compose --> Web[Unprivileged Nginx container, port 8080]
-    Compose --> API[Express API container, port 5000]
-    HostNginx[Host Nginx, HTTP/HTTPS 80/443] -->|Active slot 18080 or 18081| Web
+    Dev[Developer edits in Replit] -->|Stage, commit, push| GitHub[GitHub repository]
+    GitHub -->|Push/PR to main| CI[ci.yml checks and build validation]
+    GitHub -->|Manual workflow_dispatch| DeployWorkflow[deploy.yml]
+    DeployWorkflow -->|SSH as existing EC2 user| Sync[Copy repository files to EC2 app directory]
+    Sync --> Compose[Run deploy/deploy.sh => docker compose up --build -d]
+    Compose --> Web[Frontend Nginx container :8080]
+    Compose --> API[Express API container :5000]
+    HostNginx[Host Nginx :80/:443] -->|proxy_pass 127.0.0.1:18080| Web
     Web -->|/api/*| API
-    Script -->|Switch upstream only after healthy checks| HostNginx
