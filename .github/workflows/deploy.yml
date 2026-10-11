@@ -1,6 +1,14 @@
 name: Deploy portfolio to EC2
 
+# Architecture: images are built once on the GitHub-hosted runner, pushed to
+# GitHub Container Registry (GHCR) tagged with the exact commit SHA, then EC2
+# pulls and runs that same artifact. EC2 never builds from source. See
+# AWS_DEPLOYMENT.md (CI/CD section) for the full rationale and setup guide.
+
 on:
+  push:
+    branches:
+      - main
   workflow_dispatch:
     inputs:
       ref:
@@ -8,64 +16,164 @@ on:
         required: false
         default: main
 
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
+
 permissions:
   contents: read
 
-concurrency:
-  group: developer-portfolio-deploy
-  cancel-in-progress: false
-
 jobs:
-  deploy:
-    name: Sync and deploy on EC2
+  # Gate on a configurable deploy branch (repo variable DEPLOY_BRANCH,
+  # defaults to "main"). GitHub Actions can't read repo variables inside the
+  # top-level `on:` trigger, so this job re-checks after the fact and every
+  # later job is gated on its result.
+  gate:
+    name: Check deploy branch
     runs-on: ubuntu-latest
-    env:
-      EC2_HOST: ${{ vars.EC2_HOST }}
-      EC2_USER: ${{ vars.EC2_USER || 'ubuntu' }}
-      EC2_APP_DIR: ${{ vars.EC2_APP_DIR }}
-      EC2_SSH_PRIVATE_KEY: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
+    outputs:
+      proceed: ${{ steps.check.outputs.proceed }}
     steps:
-      - name: Validate deployment settings
-        shell: bash
+      - name: Evaluate DEPLOY_BRANCH gate
+        id: check
         run: |
-          [[ -n "$EC2_HOST" ]] || {
-            echo "Set repository variable EC2_HOST to your EC2 public DNS name or IPv4 address."
-            exit 1
-          }
-          [[ -n "$EC2_USER" ]] || {
-            echo "Set repository variable EC2_USER (or leave empty to use ubuntu)."
-            exit 1
-          }
-          [[ -n "$EC2_SSH_PRIVATE_KEY" ]] || {
-            echo "Set repository secret EC2_SSH_PRIVATE_KEY with a key allowed for the EC2 user."
-            exit 1
-          }
+          target="${{ vars.DEPLOY_BRANCH || 'main' }}"
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+          elif [[ "${{ github.ref_name }}" == "$target" ]]; then
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Skipping deploy: push was to '${{ github.ref_name }}', configured DEPLOY_BRANCH is '$target'."
+          fi
 
+  # Stage 1: reuse the existing CI workflow (install, lint, test, typecheck,
+  # build, compose validation) instead of duplicating it here.
+  validate:
+    name: Validate
+    needs: gate
+    if: needs.gate.outputs.proceed == 'true'
+    uses: ./.github/workflows/ci.yml
+
+  # Stage 2: build both images once on the runner and push to GHCR, tagged
+  # with the exact commit SHA that passed validation.
+  build-and-push:
+    name: Build and push images
+    needs: [gate, validate]
+    if: needs.gate.outputs.proceed == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      api_image: ${{ steps.tags.outputs.api_image }}
+      web_image: ${{ steps.tags.outputs.web_image }}
+      commit_sha: ${{ steps.resolve.outputs.sha }}
+    steps:
       - name: Check out source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           ref: ${{ github.event.inputs.ref || github.ref }}
 
-      - name: Upload repository files to EC2
+      - name: Resolve deployed commit SHA
+        id: resolve
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Compute image tags
+        id: tags
+        run: |
+          repo_lower=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+          sha="${{ steps.resolve.outputs.sha }}"
+          echo "api_image=ghcr.io/${repo_lower}-api:sha-${sha}" >> "$GITHUB_OUTPUT"
+          echo "web_image=ghcr.io/${repo_lower}-web:sha-${sha}" >> "$GITHUB_OUTPUT"
+          echo "api_latest=ghcr.io/${repo_lower}-api:latest" >> "$GITHUB_OUTPUT"
+          echo "web_latest=ghcr.io/${repo_lower}-web:latest" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push API image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: deploy/Dockerfile.api
+          push: true
+          tags: |
+            ${{ steps.tags.outputs.api_image }}
+            ${{ steps.tags.outputs.api_latest }}
+          cache-from: type=gha,scope=api
+          cache-to: type=gha,mode=max,scope=api
+
+      - name: Build and push web image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: deploy/Dockerfile.frontend
+          push: true
+          tags: |
+            ${{ steps.tags.outputs.web_image }}
+            ${{ steps.tags.outputs.web_latest }}
+          cache-from: type=gha,scope=web
+          cache-to: type=gha,mode=max,scope=web
+
+  # Stage 3: SSH to EC2, sync only the small deploy-config files (not the
+  # whole source tree — EC2 no longer builds anything), log in to GHCR with
+  # the still-valid job token, and pull + start the exact images built above.
+  deploy:
+    name: Deploy to EC2
+    needs: [gate, build-and-push]
+    if: needs.gate.outputs.proceed == 'true'
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      EC2_HOST: ${{ vars.EC2_HOST }}
+      EC2_USER: ${{ vars.EC2_USER || 'ubuntu' }}
+      EC2_SSH_PORT: ${{ vars.EC2_SSH_PORT || '22' }}
+      EC2_APP_DIR: ${{ vars.EC2_APP_DIR }}
+      API_IMAGE: ${{ needs.build-and-push.outputs.api_image }}
+      WEB_IMAGE: ${{ needs.build-and-push.outputs.web_image }}
+    steps:
+      - name: Validate deployment settings
         shell: bash
+        run: |
+          [[ -n "$EC2_HOST" ]] || { echo "Set repository variable EC2_HOST."; exit 1; }
+          [[ -n "$EC2_APP_DIR" ]] || { echo "Set repository variable EC2_APP_DIR (e.g. /home/ubuntu/Replit_porject)."; exit 1; }
+          [[ -n "${{ secrets.EC2_SSH_KEY }}" ]] || { echo "Set repository secret EC2_SSH_KEY."; exit 1; }
+          [[ -n "${{ secrets.EC2_KNOWN_HOSTS }}" ]] || { echo "Set repository secret EC2_KNOWN_HOSTS (see AWS_DEPLOYMENT.md for how to generate it)."; exit 1; }
+
+      - name: Check out deploy configuration
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
+
+      - name: Sync deploy config and run pull-based deployment
+        shell: bash
+        env:
+          GH_TOKEN_FOR_GHCR: ${{ secrets.GITHUB_TOKEN }}
+          GH_ACTOR: ${{ github.actor }}
         run: |
           set -euo pipefail
           key_file="$RUNNER_TEMP/ec2-deploy-key"
           known_hosts_file="$RUNNER_TEMP/ec2-known-hosts"
-          app_dir="$EC2_APP_DIR"
-          if [[ -z "$app_dir" ]]; then
-            app_dir="/home/$EC2_USER/developer-portfolio"
-          fi
           trap 'rm -f "$key_file" "$known_hosts_file"' EXIT
 
           umask 077
-          printf '%s\n' "$EC2_SSH_PRIVATE_KEY" > "$key_file"
-
-          ssh-keyscan -H "$EC2_HOST" > "$known_hosts_file"
+          printf '%s\n' "${{ secrets.EC2_SSH_KEY }}" > "$key_file"
+          # Host key comes from a pre-verified secret, never from a live
+          # ssh-keyscan at deploy time, so this can stay strict.
+          printf '%s\n' "${{ secrets.EC2_KNOWN_HOSTS }}" > "$known_hosts_file"
 
           ssh \
             -F /dev/null \
             -i "$key_file" \
+            -p "$EC2_SSH_PORT" \
             -o BatchMode=yes \
             -o ConnectTimeout=20 \
             -o IdentitiesOnly=yes \
@@ -73,38 +181,22 @@ jobs:
             -o StrictHostKeyChecking=yes \
             -o UserKnownHostsFile="$known_hosts_file" \
             "$EC2_USER@$EC2_HOST" \
-            "mkdir -p '$app_dir'"
+            "mkdir -p '$EC2_APP_DIR'"
 
+          # Only the deploy config travels to EC2 (compose.yaml + deploy/) —
+          # no source, no node_modules, no .env, no --delete (so
+          # .deploy-state and anything else already on the box is untouched).
           rsync \
             --archive \
-            --delete \
             --compress \
-            --exclude '.git/' \
-            --exclude 'node_modules/' \
-            --exclude 'artifacts/**/dist/' \
-            --exclude '*.log' \
-            -e "ssh -F /dev/null -i '$key_file' -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile='$known_hosts_file'" \
-            ./ "$EC2_USER@$EC2_HOST:$app_dir/"
-
-      - name: Build and restart app with Docker Compose
-        shell: bash
-        run: |
-          set -euo pipefail
-          key_file="$RUNNER_TEMP/ec2-deploy-key"
-          known_hosts_file="$RUNNER_TEMP/ec2-known-hosts"
-          app_dir="$EC2_APP_DIR"
-          if [[ -z "$app_dir" ]]; then
-            app_dir="/home/$EC2_USER/developer-portfolio"
-          fi
-          trap 'rm -f "$key_file" "$known_hosts_file"' EXIT
-
-          umask 077
-          printf '%s\n' "$EC2_SSH_PRIVATE_KEY" > "$key_file"
-          ssh-keyscan -H "$EC2_HOST" > "$known_hosts_file"
+            -e "ssh -F /dev/null -i '$key_file' -p '$EC2_SSH_PORT' -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile='$known_hosts_file'" \
+            compose.yaml deploy \
+            "$EC2_USER@$EC2_HOST:$EC2_APP_DIR/"
 
           ssh \
             -F /dev/null \
             -i "$key_file" \
+            -p "$EC2_SSH_PORT" \
             -o BatchMode=yes \
             -o ConnectTimeout=20 \
             -o IdentitiesOnly=yes \
@@ -112,4 +204,128 @@ jobs:
             -o StrictHostKeyChecking=yes \
             -o UserKnownHostsFile="$known_hosts_file" \
             "$EC2_USER@$EC2_HOST" \
-            "chmod +x '$app_dir/deploy/deploy.sh' && cd '$app_dir' && '$app_dir/deploy/deploy.sh' deploy && '$app_dir/deploy/deploy.sh' status"
+            "bash -s" <<REMOTE
+          set -Eeuo pipefail
+          cd '$EC2_APP_DIR'
+          chmod +x deploy/deploy.sh
+
+          token_file="\$(mktemp)"
+          trap 'docker logout ghcr.io >/dev/null 2>&1 || true; rm -f "\$token_file"' EXIT
+          printf '%s' '$GH_TOKEN_FOR_GHCR' > "\$token_file"
+          chmod 600 "\$token_file"
+          docker login ghcr.io -u '$GH_ACTOR' --password-stdin < "\$token_file"
+
+          export API_IMAGE='$API_IMAGE'
+          export WEB_IMAGE='$WEB_IMAGE'
+          ./deploy/deploy.sh pull-deploy
+          REMOTE
+
+  # Stage 4: confirm the site is actually reachable over the public internet
+  # path (host Nginx on port 80), not just healthy from inside EC2.
+  smoke-test:
+    name: Public smoke test
+    needs: [gate, deploy]
+    if: needs.gate.outputs.proceed == 'true'
+    runs-on: ubuntu-latest
+    env:
+      EC2_HOST: ${{ vars.EC2_HOST }}
+    steps:
+      - name: Probe public endpoints with bounded retries
+        shell: bash
+        run: |
+          set -uo pipefail
+          attempts=10
+          delay=6
+          for i in $(seq 1 "$attempts"); do
+            if curl --fail --silent --show-error --max-time 5 --output /dev/null "http://$EC2_HOST/" \
+              && curl --fail --silent --show-error --max-time 5 "http://$EC2_HOST/api/healthz" \
+                 | grep --quiet --extended-regexp '"status"[[:space:]]*:[[:space:]]*"ok"'; then
+              echo "Smoke test passed on attempt $i/$attempts."
+              exit 0
+            fi
+            echo "Attempt $i/$attempts failed, retrying in ${delay}s..."
+            sleep "$delay"
+          done
+          echo "::error::Public smoke test failed after $attempts attempts against http://$EC2_HOST/"
+          exit 1
+
+  # Stage 5: if the deploy or the public smoke test failed, automatically
+  # revert EC2 to the last known-good images. Never deletes volumes/data.
+  rollback:
+    name: Rollback to previous release
+    needs: [gate, deploy, smoke-test]
+    if: always() && needs.gate.outputs.proceed == 'true' && (needs.deploy.result == 'failure' || needs.smoke-test.result == 'failure')
+    runs-on: ubuntu-latest
+    env:
+      EC2_HOST: ${{ vars.EC2_HOST }}
+      EC2_USER: ${{ vars.EC2_USER || 'ubuntu' }}
+      EC2_SSH_PORT: ${{ vars.EC2_SSH_PORT || '22' }}
+      EC2_APP_DIR: ${{ vars.EC2_APP_DIR }}
+    steps:
+      - name: Roll back EC2 to previous release
+        shell: bash
+        run: |
+          set -euo pipefail
+          key_file="$RUNNER_TEMP/ec2-deploy-key"
+          known_hosts_file="$RUNNER_TEMP/ec2-known-hosts"
+          trap 'rm -f "$key_file" "$known_hosts_file"' EXIT
+
+          umask 077
+          printf '%s\n' "${{ secrets.EC2_SSH_KEY }}" > "$key_file"
+          printf '%s\n' "${{ secrets.EC2_KNOWN_HOSTS }}" > "$known_hosts_file"
+
+          ssh \
+            -F /dev/null \
+            -i "$key_file" \
+            -p "$EC2_SSH_PORT" \
+            -o BatchMode=yes \
+            -o ConnectTimeout=20 \
+            -o IdentitiesOnly=yes \
+            -o PasswordAuthentication=no \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$known_hosts_file" \
+            "$EC2_USER@$EC2_HOST" \
+            "cd '$EC2_APP_DIR' && chmod +x deploy/deploy.sh && ./deploy/deploy.sh rollback"
+
+      - name: Report rollback outcome
+        if: always()
+        run: |
+          {
+            echo "## Rollback triggered"
+            echo "Deploy or smoke test failed for commit \`${{ needs.build-and-push.result == 'success' && 'see build-and-push job' || github.sha }}\`."
+            echo "EC2 was reverted to the previous known-good release (see \`.deploy-state/current.env\` on the server)."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # Always-run final report so a glance at the workflow run shows exactly
+  # what shipped and whether it's actually live.
+  report:
+    name: Deployment summary
+    needs: [gate, build-and-push, deploy, smoke-test, rollback]
+    if: always() && needs.gate.outputs.proceed == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Write summary
+        run: |
+          {
+            echo "## Deployment summary"
+            echo ""
+            echo "| Item | Value |"
+            echo "|---|---|"
+            echo "| Commit | \`${{ needs.build-and-push.outputs.commit_sha || github.sha }}\` |"
+            echo "| API image | \`${{ needs.build-and-push.outputs.api_image || 'not built' }}\` |"
+            echo "| Web image | \`${{ needs.build-and-push.outputs.web_image || 'not built' }}\` |"
+            echo "| Build and push | ${{ needs.build-and-push.result }} |"
+            echo "| Deploy | ${{ needs.deploy.result }} |"
+            echo "| Smoke test | ${{ needs.smoke-test.result }} |"
+            echo "| Rollback | ${{ needs.rollback.result }} |"
+            if [[ "${{ needs.deploy.result }}" == "success" && "${{ needs.smoke-test.result }}" == "success" ]]; then
+              echo ""
+              echo "**Live at http://${{ vars.EC2_HOST }}/**"
+            elif [[ "${{ needs.rollback.result }}" == "success" ]]; then
+              echo ""
+              echo "**Deployment failed and was automatically rolled back. Site should still be serving the previous release.**"
+            else
+              echo ""
+              echo "**Deployment did not complete successfully. Check the failed job's logs above.**"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -239,32 +239,117 @@ docker compose down
 
 ---
 
-## 9. Optional: automated deploys via GitHub Actions
+## 9. Automated CI/CD via GitHub Actions
 
-The repo includes `.github/workflows/deploy.yml`, a manual (`workflow_dispatch`) workflow that rsyncs the repo to EC2 over SSH and runs `deploy/deploy.sh deploy` for you.
+`.github/workflows/deploy.yml` is a multistage pipeline that runs automatically on every push to the deploy branch (`main` by default), and can also be triggered manually.
 
-### 9.1 Generate a dedicated deploy key (on your local machine)
+### 9.0 Architecture
+
+```
+push to main
+     │
+     ▼
+┌─────────┐   ┌──────────┐   ┌──────────────────┐   ┌─────────────┐   ┌──────────┐
+│  gate   │──▶│ validate │──▶│  build-and-push   │──▶│   deploy    │──▶│ smoke-   │
+│(branch  │   │ (reuses  │   │ (build api+web,   │   │ (SSH, sync  │   │ test     │
+│ check)  │   │ ci.yml)  │   │  push to GHCR,    │   │  config,    │   │ (curl    │
+└─────────┘   └──────────┘   │  tag = commit SHA)│   │  pull+run   │   │ public   │
+                              └──────────────────┘   │  on EC2)    │   │ IP :80)  │
+                                                      └─────────────┘   └────┬─────┘
+                                                                              │ fails
+                                                                              ▼
+                                                                      ┌──────────────┐
+                                                                      │  rollback     │
+                                                                      │ (revert EC2   │
+                                                                      │  to previous  │
+                                                                      │  image tag)   │
+                                                                      └──────────────┘
+                                   all stages ──────────────────────▶ report (summary)
+```
+
+**Why build-once-push-to-registry instead of building on EC2:**
+- CI runners have far more CPU/RAM than a small EC2 instance — no more OOM risk during the build.
+- The exact artifact that passed lint/typecheck/tests in `validate` is what gets deployed — not a fresh rebuild from rsynced source that could theoretically drift.
+- Rollback becomes trivial: point Compose back at the previous image tag and restart — no rebuild needed.
+- EC2 only needs `compose.yaml` and the `deploy/` folder synced to it — not the whole monorepo — so deploys are smaller and EC2 never needs source-level Git credentials.
+- No new infrastructure: GitHub Container Registry (GHCR) is part of GitHub itself and authenticates with the workflow's own built-in token — no Docker Hub account, no extra secret for registry auth.
+
+### 9.1 GitHub Secrets and Variables
+
+| Name | Kind | Required | Purpose |
+|---|---|---|---|
+| `EC2_SSH_KEY` | Secret | Yes | Private half of a dedicated deploy keypair (see 9.2). |
+| `EC2_KNOWN_HOSTS` | Secret | Yes | The EC2 instance's SSH host public key, pre-verified (see 9.3). Used instead of blind `ssh-keyscan` so host identity is actually checked, not just trust-on-first-use. |
+| `EC2_HOST` | Variable | Yes | EC2 public IP or domain. |
+| `EC2_APP_DIR` | Variable | Yes | Absolute path to the app directory on EC2, e.g. `/home/ubuntu/Replit_porject` (use your actual directory). |
+| `EC2_USER` | Variable | No (default `ubuntu`) | SSH login user. |
+| `EC2_SSH_PORT` | Variable | No (default `22`) | SSH port, if changed from default. |
+| `DEPLOY_BRANCH` | Variable | No (default `main`) | Which branch triggers an actual deploy; pushes to other branches still run `validate` via normal CI but the deploy pipeline no-ops. |
+
+No GHCR-specific secret is needed — the workflow logs in with the automatically-provided `GITHUB_TOKEN`, both to push (from the runner) and to let EC2 pull (over the still-valid token, passed only over the encrypted SSH session, never written to a log).
+
+### 9.2 Generate a dedicated deploy SSH key
+
+On your own machine (not EC2, not in this repo):
 ```bash
 ssh-keygen -t ed25519 -f deploy_key -C "github-actions-deploy" -N ""
 ```
 
-### 9.2 Authorize the public key on EC2
+Authorize the public half on EC2:
 ```bash
 cat deploy_key.pub | ssh -i your-key.pem ubuntu@<EC2_PUBLIC_IP> \
   "mkdir -p ~/.ssh && cat >> ~/.ssh/authorized_keys && chmod 700 ~/.ssh && chmod 600 ~/.ssh/authorized_keys"
 ```
 
-### 9.3 Add GitHub repository secrets/variables
-In GitHub → repo → **Settings → Secrets and variables → Actions**:
-- Secret `EC2_SSH_PRIVATE_KEY` — contents of `deploy_key` (the private key, not `.pub`)
-- Variable `EC2_HOST` — your EC2 public IP or domain
-- Variable `EC2_USER` — `ubuntu` (optional, this is the default)
-- Variable `EC2_APP_DIR` — `/home/ubuntu/developer-portfolio` (optional, this is the default)
+Save `deploy_key` (the private key) as the GitHub secret `EC2_SSH_KEY`, then delete both `deploy_key` and `deploy_key.pub` from your machine — don't keep a copy lying around once it's in GitHub.
 
-### 9.4 Run it
-GitHub → repo → **Actions** tab → **Deploy portfolio to EC2** → **Run workflow**.
+### 9.3 Get a verified host key for `EC2_KNOWN_HOSTS`
 
-Delete `deploy_key` and `deploy_key.pub` from your local machine once the secret is saved — don't keep a copy of the private key around.
+Don't just pipe `ssh-keyscan` straight into the secret — that trusts whatever answers on the first connection (classic MITM blind spot). Verify it against the instance's actual fingerprint first:
+
+```bash
+# 1. Capture the host key AWS actually assigned this instance (from the EC2
+#    console, not the network): EC2 → instance → Actions → Monitor and
+#    troubleshoot → Get system log. Ubuntu prints the host key fingerprints
+#    near the top of the boot log, e.g.:
+#    ec2: #############################################################
+#    ec2: -----BEGIN SSH HOST KEY FINGERPRINTS-----
+#    ec2: 256 SHA256:AbCdEf... root@ip-10-0-0-1 (ED25519)
+#    ec2: -----END SSH HOST KEY FINGERPRINTS-----
+
+# 2. From your machine, fetch the key and compare its fingerprint to the one
+#    from the system log:
+ssh-keyscan -t ed25519 -H <EC2_PUBLIC_IP> > ec2-known-hosts
+ssh-keygen -lf ec2-known-hosts
+
+# 3. Only if the SHA256 fingerprint matches the system log, save the
+#    contents of ec2-known-hosts as the GitHub secret EC2_KNOWN_HOSTS, then
+#    delete the local file.
+```
+
+Alternatively, the fingerprint printed the very first time you manually `ssh` into a brand-new instance (the "are you sure you want to continue connecting" prompt) is the same value — compare that against the system log instead of blindly accepting it.
+
+### 9.4 First run
+
+1. Add the secrets and variables above in GitHub → repo → **Settings → Secrets and variables → Actions**.
+2. Make sure `EC2_APP_DIR` already exists on EC2 with a working `compose.yaml` and `deploy/` folder (i.e. you've done the manual first deploy in sections 1–6 at least once) — the pipeline only ever syncs `compose.yaml` and `deploy/`, it does not bootstrap Docker, Nginx, or the host from scratch.
+3. Push to `main`, or trigger manually: GitHub → repo → **Actions** → **Deploy portfolio to EC2** → **Run workflow**.
+4. Watch the run. Each job (`gate` → `validate` → `build-and-push` → `deploy` → `smoke-test` → `report`) must go green in order. The final **Deployment summary** in the run's job summary shows the deployed commit, image tags, and the live URL.
+
+### 9.5 Rollback
+
+Automatic: if `deploy` or `smoke-test` fails, the `rollback` job runs by itself and reverts EC2 to the last successfully deployed image tags — using images already cached on the box, so it works even if GHCR is briefly unreachable. No data, volumes, or the Nginx config are touched.
+
+Manual (from the EC2 instance, any time):
+```bash
+cd <EC2_APP_DIR>
+./deploy/deploy.sh rollback     # reverts to the previous recorded release
+./deploy/deploy.sh status       # confirm containers are healthy
+```
+
+Manual (force a specific older version without waiting for CI): re-run the **Deploy portfolio to EC2** workflow with **Run workflow** → `ref` set to the older commit SHA/branch/tag you want live.
+
+There's no rollback target before the first successful pipeline-driven deploy — `./deploy/deploy.sh rollback` will say so clearly if `.deploy-state/previous.env` doesn't exist yet.
 
 ---
 

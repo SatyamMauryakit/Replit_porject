@@ -1,5 +1,6 @@
 services:
   api:
+    image: ${API_IMAGE:-replit_porject-api}
     build:
       context: .
       dockerfile: deploy/Dockerfile.api
@@ -22,6 +23,7 @@ services:
       retries: 3
 
   web:
+    image: ${WEB_IMAGE:-replit_porject-web}
     build:
       context: .
       dockerfile: deploy/Dockerfile.frontend

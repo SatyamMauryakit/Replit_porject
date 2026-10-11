@@ -55,5 +55,8 @@ Thumbs.db
 *.pem
 *.key
 
+# Deploy release-tracking state (lives only on the deploy target)
+.deploy-state/
+
 # User-uploaded prompt and reference files
 /attached_assets/
