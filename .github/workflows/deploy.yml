@@ -2,9 +2,9 @@ name: Deploy portfolio to EC2
 
 # Architecture: images are built once on the GitHub-hosted runner, pushed to
 # GitHub Container Registry (GHCR) tagged with the exact commit SHA. An IAM
-# user authenticates GitHub Actions to AWS; deployment itself runs over AWS
-# Systems Manager (SSM) Run Command, not SSH — no SSH key, no open port 22,
-# no SSH host-key management needed for CI. The small deploy config
+# user authenticates GitHub Actions to AWS; deployment prefers AWS Systems
+# Manager (SSM) Run Command, and falls back to SSH when the instance is not
+# SSM-managed. The small deploy config
 # (compose.yaml + deploy/) travels via a private S3 bucket because SSM Run
 # Command has no file-transfer primitive of its own. See
 # IAM_DEPLOYMENT_SETUP.md for the full setup guide (IAM policy, S3 bucket,
@@ -130,9 +130,10 @@ jobs:
 
   # Stage 3: upload the small deploy config (compose.yaml + deploy/) to a
   # private S3 bucket, then use AWS Systems Manager Run Command to have EC2
-  # fetch it and run pull-deploy. No SSH involved. The IAM user authenticated
-  # via aws-actions/configure-aws-credentials only has permission to call SSM
-  # on this one instance and write to this one S3 prefix — see
+  # fetch it and run pull-deploy. If the instance is not SSM-managed, fall
+  # back to direct SSH deployment using EC2_SSH_PRIVATE_KEY. The IAM user
+  # authenticated via aws-actions/configure-aws-credentials only has permission
+  # to call SSM on this one instance and write to this one S3 prefix — see
   # IAM_DEPLOYMENT_SETUP.md for the exact policy.
   deploy:
     name: Deploy to EC2 (via AWS SSM)
@@ -143,7 +144,10 @@ jobs:
     env:
       AWS_REGION: ${{ vars.AWS_REGION }}
       EC2_INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID }}
+      EC2_HOST: ${{ vars.EC2_HOST }}
+      EC2_USER: ${{ vars.EC2_USER || 'ubuntu' }}
       EC2_APP_DIR: ${{ vars.EC2_APP_DIR }}
+      EC2_SSH_PRIVATE_KEY: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
       DEPLOY_S3_BUCKET: ${{ vars.DEPLOY_S3_BUCKET }}
       API_IMAGE: ${{ needs.build-and-push.outputs.api_image }}
       WEB_IMAGE: ${{ needs.build-and-push.outputs.web_image }}
@@ -154,6 +158,7 @@ jobs:
         run: |
           [[ -n "$AWS_REGION" ]] || { echo "Set repository variable AWS_REGION."; exit 1; }
           [[ -n "$EC2_INSTANCE_ID" ]] || { echo "Set repository variable EC2_INSTANCE_ID (e.g. i-0123456789abcdef0)."; exit 1; }
+          [[ -n "$EC2_HOST" ]] || { echo "Set repository variable EC2_HOST."; exit 1; }
           [[ -n "$EC2_APP_DIR" ]] || { echo "Set repository variable EC2_APP_DIR (e.g. /home/ubuntu/Replit_porject)."; exit 1; }
           [[ -n "$DEPLOY_S3_BUCKET" ]] || { echo "Set repository variable DEPLOY_S3_BUCKET."; exit 1; }
           [[ -n "${{ secrets.AWS_ACCESS_KEY_ID }}" ]] || { echo "Set repository secret AWS_ACCESS_KEY_ID."; exit 1; }
@@ -171,7 +176,8 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Ensure EC2 instance is running and SSM-online
+      - name: Ensure EC2 instance is running and detect SSM availability
+        id: readiness
         shell: bash
         run: |
           set -euo pipefail
@@ -200,6 +206,7 @@ jobs:
           aws ec2 wait instance-running --instance-ids "$EC2_INSTANCE_ID"
           aws ec2 wait instance-status-ok --instance-ids "$EC2_INSTANCE_ID"
 
+          ssm_online=false
           echo "Waiting for SSM PingStatus to become Online..."
           for i in $(seq 1 30); do
             ping_status=$(aws ssm describe-instance-information \
@@ -208,16 +215,19 @@ jobs:
               --output text 2>/dev/null || echo "Unknown")
             echo "Attempt $i/30: PingStatus=$ping_status"
             if [[ "$ping_status" == "Online" ]]; then
+              ssm_online=true
               break
-            fi
-            if [[ "$i" -eq 30 ]]; then
-              echo "::error::EC2 instance $EC2_INSTANCE_ID did not become SSM-online in time."
-              exit 1
             fi
             sleep 10
           done
 
+          if [[ "$ssm_online" != "true" ]]; then
+            echo "::warning::EC2 instance $EC2_INSTANCE_ID is not SSM-online. Deployment will fall back to SSH if EC2_SSH_PRIVATE_KEY is configured."
+          fi
+          echo "ssm_online=$ssm_online" >> "$GITHUB_OUTPUT"
+
       - name: Upload deploy config to S3
+        if: steps.readiness.outputs.ssm_online == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -225,6 +235,7 @@ jobs:
           aws s3 cp /tmp/deploy-config.tgz "s3://$DEPLOY_S3_BUCKET/releases/$COMMIT_SHA.tgz"
 
       - name: Run pull-based deployment via SSM
+        if: steps.readiness.outputs.ssm_online == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -278,6 +289,51 @@ jobs:
             exit 1
           fi
 
+      - name: Run pull-based deployment via SSH fallback
+        if: steps.readiness.outputs.ssm_online != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ -n "$EC2_SSH_PRIVATE_KEY" ]] || { echo "::error::EC2_SSH_PRIVATE_KEY is required when SSM is unavailable."; exit 1; }
+
+          key_file="$RUNNER_TEMP/ec2-deploy-key"
+          known_hosts_file="$RUNNER_TEMP/ec2-known-hosts"
+          trap 'rm -f "$key_file" "$known_hosts_file"' EXIT
+
+          umask 077
+          printf '%s\n' "$EC2_SSH_PRIVATE_KEY" > "$key_file"
+          ssh-keyscan -H "$EC2_HOST" > "$known_hosts_file"
+
+          ssh \
+            -F /dev/null \
+            -i "$key_file" \
+            -o BatchMode=yes \
+            -o ConnectTimeout=20 \
+            -o IdentitiesOnly=yes \
+            -o PasswordAuthentication=no \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$known_hosts_file" \
+            "$EC2_USER@$EC2_HOST" \
+            "mkdir -p '$EC2_APP_DIR'"
+
+          rsync \
+            --archive \
+            --compress \
+            -e "ssh -F /dev/null -i '$key_file' -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile='$known_hosts_file'" \
+            compose.yaml deploy/ "$EC2_USER@$EC2_HOST:$EC2_APP_DIR/"
+
+          ssh \
+            -F /dev/null \
+            -i "$key_file" \
+            -o BatchMode=yes \
+            -o ConnectTimeout=20 \
+            -o IdentitiesOnly=yes \
+            -o PasswordAuthentication=no \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$known_hosts_file" \
+            "$EC2_USER@$EC2_HOST" \
+            "cd '$EC2_APP_DIR' && chmod +x deploy/deploy.sh && API_IMAGE='$API_IMAGE' WEB_IMAGE='$WEB_IMAGE' ./deploy/deploy.sh pull-deploy"
+
   # Stage 4: confirm the site is actually reachable over the public internet
   # path (host Nginx on port 80), not just healthy from inside EC2.
   smoke-test:
@@ -317,7 +373,10 @@ jobs:
     env:
       AWS_REGION: ${{ vars.AWS_REGION }}
       EC2_INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID }}
+      EC2_HOST: ${{ vars.EC2_HOST }}
+      EC2_USER: ${{ vars.EC2_USER || 'ubuntu' }}
       EC2_APP_DIR: ${{ vars.EC2_APP_DIR }}
+      EC2_SSH_PRIVATE_KEY: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
     steps:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
@@ -326,7 +385,8 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Ensure EC2 instance is running and SSM-online
+      - name: Ensure EC2 instance is running and detect SSM availability
+        id: readiness
         shell: bash
         run: |
           set -euo pipefail
@@ -355,6 +415,7 @@ jobs:
           aws ec2 wait instance-running --instance-ids "$EC2_INSTANCE_ID"
           aws ec2 wait instance-status-ok --instance-ids "$EC2_INSTANCE_ID"
 
+          ssm_online=false
           echo "Waiting for SSM PingStatus to become Online..."
           for i in $(seq 1 30); do
             ping_status=$(aws ssm describe-instance-information \
@@ -363,16 +424,19 @@ jobs:
               --output text 2>/dev/null || echo "Unknown")
             echo "Attempt $i/30: PingStatus=$ping_status"
             if [[ "$ping_status" == "Online" ]]; then
+              ssm_online=true
               break
-            fi
-            if [[ "$i" -eq 30 ]]; then
-              echo "::error::EC2 instance $EC2_INSTANCE_ID did not become SSM-online in time."
-              exit 1
             fi
             sleep 10
           done
 
+          if [[ "$ssm_online" != "true" ]]; then
+            echo "::warning::EC2 instance $EC2_INSTANCE_ID is not SSM-online. Rollback will fall back to SSH if EC2_SSH_PRIVATE_KEY is configured."
+          fi
+          echo "ssm_online=$ssm_online" >> "$GITHUB_OUTPUT"
+
       - name: Roll back EC2 to previous release via SSM
+        if: steps.readiness.outputs.ssm_online == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -410,6 +474,33 @@ jobs:
             echo "::error::SSM rollback command ended with status '$status'."
             exit 1
           fi
+
+      - name: Roll back EC2 to previous release via SSH fallback
+        if: steps.readiness.outputs.ssm_online != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ -n "$EC2_SSH_PRIVATE_KEY" ]] || { echo "::error::EC2_SSH_PRIVATE_KEY is required when SSM is unavailable."; exit 1; }
+
+          key_file="$RUNNER_TEMP/ec2-deploy-key"
+          known_hosts_file="$RUNNER_TEMP/ec2-known-hosts"
+          trap 'rm -f "$key_file" "$known_hosts_file"' EXIT
+
+          umask 077
+          printf '%s\n' "$EC2_SSH_PRIVATE_KEY" > "$key_file"
+          ssh-keyscan -H "$EC2_HOST" > "$known_hosts_file"
+
+          ssh \
+            -F /dev/null \
+            -i "$key_file" \
+            -o BatchMode=yes \
+            -o ConnectTimeout=20 \
+            -o IdentitiesOnly=yes \
+            -o PasswordAuthentication=no \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$known_hosts_file" \
+            "$EC2_USER@$EC2_HOST" \
+            "cd '$EC2_APP_DIR' && chmod +x deploy/deploy.sh && ./deploy/deploy.sh rollback"
 
       - name: Report rollback outcome
         if: always()
