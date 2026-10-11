@@ -171,6 +171,52 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
+      - name: Ensure EC2 instance is running and SSM-online
+        shell: bash
+        run: |
+          set -euo pipefail
+          state=$(aws ec2 describe-instances \
+            --instance-ids "$EC2_INSTANCE_ID" \
+            --query "Reservations[0].Instances[0].State.Name" \
+            --output text)
+          echo "Current EC2 state: $state"
+
+          case "$state" in
+            running)
+              ;;
+            pending)
+              echo "EC2 instance is pending; waiting for running state."
+              ;;
+            stopped|stopping)
+              echo "Starting EC2 instance $EC2_INSTANCE_ID..."
+              aws ec2 start-instances --instance-ids "$EC2_INSTANCE_ID" --output text >/dev/null
+              ;;
+            *)
+              echo "::error::EC2 instance $EC2_INSTANCE_ID is in unsupported state '$state' for deployment."
+              exit 1
+              ;;
+          esac
+
+          aws ec2 wait instance-running --instance-ids "$EC2_INSTANCE_ID"
+          aws ec2 wait instance-status-ok --instance-ids "$EC2_INSTANCE_ID"
+
+          echo "Waiting for SSM PingStatus to become Online..."
+          for i in $(seq 1 30); do
+            ping_status=$(aws ssm describe-instance-information \
+              --filters "Key=InstanceIds,Values=$EC2_INSTANCE_ID" \
+              --query "InstanceInformationList[0].PingStatus" \
+              --output text 2>/dev/null || echo "Unknown")
+            echo "Attempt $i/30: PingStatus=$ping_status"
+            if [[ "$ping_status" == "Online" ]]; then
+              break
+            fi
+            if [[ "$i" -eq 30 ]]; then
+              echo "::error::EC2 instance $EC2_INSTANCE_ID did not become SSM-online in time."
+              exit 1
+            fi
+            sleep 10
+          done
+
       - name: Upload deploy config to S3
         shell: bash
         run: |
@@ -279,6 +325,52 @@ jobs:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
+
+      - name: Ensure EC2 instance is running and SSM-online
+        shell: bash
+        run: |
+          set -euo pipefail
+          state=$(aws ec2 describe-instances \
+            --instance-ids "$EC2_INSTANCE_ID" \
+            --query "Reservations[0].Instances[0].State.Name" \
+            --output text)
+          echo "Current EC2 state: $state"
+
+          case "$state" in
+            running)
+              ;;
+            pending)
+              echo "EC2 instance is pending; waiting for running state."
+              ;;
+            stopped|stopping)
+              echo "Starting EC2 instance $EC2_INSTANCE_ID..."
+              aws ec2 start-instances --instance-ids "$EC2_INSTANCE_ID" --output text >/dev/null
+              ;;
+            *)
+              echo "::error::EC2 instance $EC2_INSTANCE_ID is in unsupported state '$state' for rollback."
+              exit 1
+              ;;
+          esac
+
+          aws ec2 wait instance-running --instance-ids "$EC2_INSTANCE_ID"
+          aws ec2 wait instance-status-ok --instance-ids "$EC2_INSTANCE_ID"
+
+          echo "Waiting for SSM PingStatus to become Online..."
+          for i in $(seq 1 30); do
+            ping_status=$(aws ssm describe-instance-information \
+              --filters "Key=InstanceIds,Values=$EC2_INSTANCE_ID" \
+              --query "InstanceInformationList[0].PingStatus" \
+              --output text 2>/dev/null || echo "Unknown")
+            echo "Attempt $i/30: PingStatus=$ping_status"
+            if [[ "$ping_status" == "Online" ]]; then
+              break
+            fi
+            if [[ "$i" -eq 30 ]]; then
+              echo "::error::EC2 instance $EC2_INSTANCE_ID did not become SSM-online in time."
+              exit 1
+            fi
+            sleep 10
+          done
 
       - name: Roll back EC2 to previous release via SSM
         shell: bash

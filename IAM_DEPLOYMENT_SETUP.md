@@ -211,6 +211,18 @@ cat > /tmp/github-actions-policy.json <<EOF
       "Resource": "*"
     },
     {
+      "Sid": "WaitForSSMOnline",
+      "Effect": "Allow",
+      "Action": "ssm:DescribeInstanceInformation",
+      "Resource": "*"
+    },
+    {
+      "Sid": "StartAndWaitForInstance",
+      "Effect": "Allow",
+      "Action": ["ec2:DescribeInstances", "ec2:DescribeInstanceStatus", "ec2:StartInstances"],
+      "Resource": "*"
+    },
+    {
       "Sid": "UploadDeployArtifacts",
       "Effect": "Allow",
       "Action": "s3:PutObject",
