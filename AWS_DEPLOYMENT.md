@@ -251,11 +251,11 @@ push to main
      ▼
 ┌─────────┐   ┌──────────┐   ┌──────────────────┐   ┌─────────────┐   ┌──────────┐
 │  gate   │──▶│ validate │──▶│  build-and-push   │──▶│   deploy    │──▶│ smoke-   │
-│(branch  │   │ (reuses  │   │ (build api+web,   │   │ (SSH, sync  │   │ test     │
-│ check)  │   │ ci.yml)  │   │  push to GHCR,    │   │  config,    │   │ (curl    │
-└─────────┘   └──────────┘   │  tag = commit SHA)│   │  pull+run   │   │ public   │
-                              └──────────────────┘   │  on EC2)    │   │ IP :80)  │
-                                                      └─────────────┘   └────┬─────┘
+│(branch  │   │ (reuses  │   │ (build api+web,   │   │ (AWS SSM,   │   │ test     │
+│ check)  │   │ ci.yml)  │   │  push to GHCR,    │   │  no SSH —   │   │ (curl    │
+└─────────┘   └──────────┘   │  tag = commit SHA)│   │  see below) │   │ public   │
+                              └──────────────────┘   └─────────────┘   │ IP :80)  │
+                                                                        └────┬─────┘
                                                                               │ fails
                                                                               ▼
                                                                       ┌──────────────┐
@@ -271,67 +271,33 @@ push to main
 - CI runners have far more CPU/RAM than a small EC2 instance — no more OOM risk during the build.
 - The exact artifact that passed lint/typecheck/tests in `validate` is what gets deployed — not a fresh rebuild from rsynced source that could theoretically drift.
 - Rollback becomes trivial: point Compose back at the previous image tag and restart — no rebuild needed.
-- EC2 only needs `compose.yaml` and the `deploy/` folder synced to it — not the whole monorepo — so deploys are smaller and EC2 never needs source-level Git credentials.
-- No new infrastructure: GitHub Container Registry (GHCR) is part of GitHub itself and authenticates with the workflow's own built-in token — no Docker Hub account, no extra secret for registry auth.
+- EC2 only needs `compose.yaml` and the `deploy/` folder — not the whole monorepo — so deploys are smaller.
+- GitHub Container Registry (GHCR) is part of GitHub itself; no Docker Hub account needed.
+
+**The `deploy` stage uses an IAM user + AWS Systems Manager (SSM), not SSH.** GitHub Actions authenticates to AWS with a dedicated IAM user's access keys, uploads the small deploy config to a private S3 bucket, then runs `deploy/deploy.sh pull-deploy` on the instance via `aws ssm send-command` — no SSH key, no open port 22 for CI, no SSH host-key management.
+
+**Full setup walkthrough — IAM policy, S3 bucket, EC2 instance role, exact commands: see `IAM_DEPLOYMENT_SETUP.md`.** That's the file to follow end to end for setting up the credentials below. This section only summarizes the result.
 
 ### 9.1 GitHub Secrets and Variables
 
 | Name | Kind | Required | Purpose |
 |---|---|---|---|
-| `EC2_SSH_KEY` | Secret | Yes | Private half of a dedicated deploy keypair (see 9.2). |
-| `EC2_KNOWN_HOSTS` | Secret | Yes | The EC2 instance's SSH host public key, pre-verified (see 9.3). Used instead of blind `ssh-keyscan` so host identity is actually checked, not just trust-on-first-use. |
-| `EC2_HOST` | Variable | Yes | EC2 public IP or domain. |
-| `EC2_APP_DIR` | Variable | Yes | Absolute path to the app directory on EC2, e.g. `/home/ubuntu/Replit_porject` (use your actual directory). |
-| `EC2_USER` | Variable | No (default `ubuntu`) | SSH login user. |
-| `EC2_SSH_PORT` | Variable | No (default `22`) | SSH port, if changed from default. |
+| `AWS_ACCESS_KEY_ID` | Secret | Yes | IAM user access key (see `IAM_DEPLOYMENT_SETUP.md` §3.4). |
+| `AWS_SECRET_ACCESS_KEY` | Secret | Yes | IAM user secret key. |
+| `AWS_REGION` | Variable | Yes | Your EC2 instance's AWS region, e.g. `us-east-1`. |
+| `EC2_INSTANCE_ID` | Variable | Yes | Your instance ID, e.g. `i-0123456789abcdef0`. |
+| `EC2_APP_DIR` | Variable | Yes | Absolute path to the app directory on EC2, e.g. `/home/ubuntu/Replit_porject`. |
+| `DEPLOY_S3_BUCKET` | Variable | Yes | The private S3 bucket deploy config is staged through. |
+| `EC2_HOST` | Variable | Yes | EC2 public IP or domain — used for the public smoke test, not for connecting. |
 | `DEPLOY_BRANCH` | Variable | No (default `main`) | Which branch triggers an actual deploy; pushes to other branches still run `validate` via normal CI but the deploy pipeline no-ops. |
 
-No GHCR-specific secret is needed — the workflow logs in with the automatically-provided `GITHUB_TOKEN`, both to push (from the runner) and to let EC2 pull (over the still-valid token, passed only over the encrypted SSH session, never written to a log).
+No GHCR-specific secret is needed — the pipeline pushes with the automatic `GITHUB_TOKEN`, and the packages are set to public visibility (see `IAM_DEPLOYMENT_SETUP.md` §3.5) so EC2 can pull with no registry credential at all.
 
-### 9.2 Generate a dedicated deploy SSH key
-
-On your own machine (not EC2, not in this repo):
-```bash
-ssh-keygen -t ed25519 -f deploy_key -C "github-actions-deploy" -N ""
-```
-
-Authorize the public half on EC2:
-```bash
-cat deploy_key.pub | ssh -i your-key.pem ubuntu@<EC2_PUBLIC_IP> \
-  "mkdir -p ~/.ssh && cat >> ~/.ssh/authorized_keys && chmod 700 ~/.ssh && chmod 600 ~/.ssh/authorized_keys"
-```
-
-Save `deploy_key` (the private key) as the GitHub secret `EC2_SSH_KEY`, then delete both `deploy_key` and `deploy_key.pub` from your machine — don't keep a copy lying around once it's in GitHub.
-
-### 9.3 Get a verified host key for `EC2_KNOWN_HOSTS`
-
-Don't just pipe `ssh-keyscan` straight into the secret — that trusts whatever answers on the first connection (classic MITM blind spot). Verify it against the instance's actual fingerprint first:
-
-```bash
-# 1. Capture the host key AWS actually assigned this instance (from the EC2
-#    console, not the network): EC2 → instance → Actions → Monitor and
-#    troubleshoot → Get system log. Ubuntu prints the host key fingerprints
-#    near the top of the boot log, e.g.:
-#    ec2: #############################################################
-#    ec2: -----BEGIN SSH HOST KEY FINGERPRINTS-----
-#    ec2: 256 SHA256:AbCdEf... root@ip-10-0-0-1 (ED25519)
-#    ec2: -----END SSH HOST KEY FINGERPRINTS-----
-
-# 2. From your machine, fetch the key and compare its fingerprint to the one
-#    from the system log:
-ssh-keyscan -t ed25519 -H <EC2_PUBLIC_IP> > ec2-known-hosts
-ssh-keygen -lf ec2-known-hosts
-
-# 3. Only if the SHA256 fingerprint matches the system log, save the
-#    contents of ec2-known-hosts as the GitHub secret EC2_KNOWN_HOSTS, then
-#    delete the local file.
-```
-
-Alternatively, the fingerprint printed the very first time you manually `ssh` into a brand-new instance (the "are you sure you want to continue connecting" prompt) is the same value — compare that against the system log instead of blindly accepting it.
+If you have leftover `EC2_SSH_KEY` / `EC2_KNOWN_HOSTS` secrets or `EC2_USER` / `EC2_SSH_PORT` variables from an earlier SSH-based version of this pipeline, they're unused now and can be deleted.
 
 ### 9.4 First run
 
-1. Add the secrets and variables above in GitHub → repo → **Settings → Secrets and variables → Actions**.
+1. Complete the one-time AWS setup in `IAM_DEPLOYMENT_SETUP.md` (S3 bucket, EC2 instance role, IAM user, GHCR package visibility) and add the secrets/variables above.
 2. Make sure `EC2_APP_DIR` already exists on EC2 with a working `compose.yaml` and `deploy/` folder (i.e. you've done the manual first deploy in sections 1–6 at least once) — the pipeline only ever syncs `compose.yaml` and `deploy/`, it does not bootstrap Docker, Nginx, or the host from scratch.
 3. Push to `main`, or trigger manually: GitHub → repo → **Actions** → **Deploy portfolio to EC2** → **Run workflow**.
 4. Watch the run. Each job (`gate` → `validate` → `build-and-push` → `deploy` → `smoke-test` → `report`) must go green in order. The final **Deployment summary** in the run's job summary shows the deployed commit, image tags, and the live URL.
