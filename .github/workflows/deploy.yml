@@ -125,19 +125,23 @@ jobs:
             # surfaces as a confusing "Invalid IAM Instance Profile name"
             # error deep inside run-instances. Retries a few times since a
             # just-created instance profile can take a few seconds to
-            # propagate before EC2 can see it.
+            # propagate before EC2 can see it. Distinguishes "doesn't exist"
+            # from "not allowed to check" instead of swallowing the real
+            # error — those need completely different fixes.
             echo "Checking that instance profile $EC2_INSTANCE_ROLE_PROFILE exists..."
             profile_found=false
             for i in $(seq 1 6); do
-              if aws iam get-instance-profile --instance-profile-name "$EC2_INSTANCE_ROLE_PROFILE" >/dev/null 2>&1; then
-                profile_found=true
-                break
+              profile_check_output=$(aws iam get-instance-profile --instance-profile-name "$EC2_INSTANCE_ROLE_PROFILE" 2>&1) && { profile_found=true; break; }
+              if echo "$profile_check_output" | grep -qi "AccessDenied"; then
+                echo "::error::IAM user is not allowed to check for instance profile '$EC2_INSTANCE_ROLE_PROFILE' (AccessDenied on iam:GetInstanceProfile). Add that permission to the IAM user's policy — IAM_DEPLOYMENT_SETUP.md section 4 — then re-run this workflow."
+                echo "$profile_check_output"
+                exit 1
               fi
               echo "Not visible yet (attempt $i/6), waiting 10s for IAM propagation..."
               sleep 10
             done
             if [[ "$profile_found" != "true" ]]; then
-              echo "::error::IAM instance profile '$EC2_INSTANCE_ROLE_PROFILE' does not exist in this AWS account (or isn't visible yet). Create it first — IAM_DEPLOYMENT_SETUP.md section 3 (aws iam create-role / create-instance-profile / add-role-to-instance-profile). If you just created it, wait ~30 seconds and re-run this workflow."
+              echo "::error::IAM instance profile '$EC2_INSTANCE_ROLE_PROFILE' does not exist in this AWS account. Create it — IAM_DEPLOYMENT_SETUP.md section 3 (aws iam create-role / create-instance-profile / add-role-to-instance-profile) — then re-run this workflow."
               exit 1
             fi
 
