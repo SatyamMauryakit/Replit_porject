@@ -249,22 +249,23 @@ docker compose down
 push to main
      │
      ▼
-┌─────────┐   ┌──────────┐   ┌──────────────────┐   ┌─────────────┐   ┌──────────┐
-│  gate   │──▶│ validate │──▶│  build-and-push   │──▶│   deploy    │──▶│ smoke-   │
-│(branch  │   │ (reuses  │   │ (build api+web,   │   │ (AWS SSM,   │   │ test     │
-│ check)  │   │ ci.yml)  │   │  push to GHCR,    │   │  no SSH —   │   │ (curl    │
-└─────────┘   └──────────┘   │  tag = commit SHA)│   │  see below) │   │ public   │
-                              └──────────────────┘   └─────────────┘   │ IP :80)  │
-                                                                        └────┬─────┘
-                                                                              │ fails
-                                                                              ▼
-                                                                      ┌──────────────┐
-                                                                      │  rollback     │
-                                                                      │ (revert EC2   │
-                                                                      │  to previous  │
-                                                                      │  image tag)   │
-                                                                      └──────────────┘
-                                   all stages ──────────────────────▶ report (summary)
+┌─────────┐   ┌───────────┐   ┌──────────┐   ┌──────────────────┐   ┌─────────────┐   ┌──────────┐
+│  gate   │──▶│ provision │   │ validate │──▶│  build-and-push   │──▶│   deploy    │──▶│ smoke-   │
+│(branch  │─┬▶│ (find or  │   │ (reuses  │   │ (build api+web,   │   │ (AWS SSM,   │   │ test     │
+│ check)  │ │ │  create   │   │ ci.yml)  │   │  push to GHCR,    │   │  no SSH)    │   │ (curl    │
+└─────────┘ │ │  EC2)     │   └──────────┘   │  tag = commit SHA)│   └─────────────┘   │ public   │
+            │ └───────────┘                  └──────────────────┘                      │ IP :80)  │
+            │                                                                           └────┬─────┘
+            └─────────────────────────────────────────────────────────────────────────────────┘
+                                                                                              │ fails
+                                                                                              ▼
+                                                                                      ┌──────────────┐
+                                                                                      │  rollback     │
+                                                                                      │ (revert EC2   │
+                                                                                      │  to previous  │
+                                                                                      │  image tag)   │
+                                                                                      └──────────────┘
+                                   all stages ──────────────────────────────────────▶ report (summary)
 ```
 
 **Why build-once-push-to-registry instead of building on EC2:**
@@ -274,43 +275,50 @@ push to main
 - EC2 only needs `compose.yaml` and the `deploy/` folder — not the whole monorepo — so deploys are smaller.
 - GitHub Container Registry (GHCR) is part of GitHub itself; no Docker Hub account needed.
 
-**The `deploy` stage uses an IAM user + AWS Systems Manager (SSM), not SSH — and no S3 or any other file transfer either.** GitHub Actions authenticates to AWS with a dedicated IAM user's access keys and runs `aws ssm send-command` to tell the instance to `git fetch` + `git checkout` the exact deployed commit directly from GitHub (this repo is public, so no credential is needed on the server for that) and then run `deploy/deploy.sh pull-deploy`. No SSH key, no open port 22 for CI, no SSH host-key management, no extra AWS storage.
+**The `provision` stage finds the EC2 instance by its `Name` tag, or creates one if it doesn't exist yet.** The very first pipeline run launches a fresh instance (security group, Elastic IP, instance role attached at launch, `deploy/bootstrap-ec2.sh` as its first-boot setup script); every run after that reuses the same tagged instance. There's no EC2 instance to launch or configure by hand before using this pipeline.
 
-**Full setup walkthrough — IAM policy, EC2 instance role, the one-time git clone, exact commands: see `IAM_DEPLOYMENT_SETUP.md`.** That's the file to follow end to end for setting up the credentials below. This section only summarizes the result.
+**The `deploy` stage uses the same IAM user + AWS Systems Manager (SSM), not SSH — and no S3 or any other file transfer either.** It runs `aws ssm send-command` to tell the instance to `git fetch` + `git checkout` the exact deployed commit directly from GitHub (this repo is public, so no credential is needed on the server for that) and then run `deploy/deploy.sh pull-deploy`. No SSH key, no open port 22, no SSH host-key management, no extra AWS storage.
+
+**Full setup walkthrough — IAM policy, instance role, exact commands: see `IAM_DEPLOYMENT_SETUP.md`.** That's the file to follow end to end. This section only summarizes the result.
 
 ### 9.1 GitHub Secrets and Variables
 
 | Name | Kind | Required | Purpose |
 |---|---|---|---|
-| `AWS_ACCESS_KEY_ID` | Secret | Yes | IAM user access key (see `IAM_DEPLOYMENT_SETUP.md` §5). |
+| `AWS_ACCESS_KEY_ID` | Secret | Yes | IAM user access key (see `IAM_DEPLOYMENT_SETUP.md` §4). |
 | `AWS_SECRET_ACCESS_KEY` | Secret | Yes | IAM user secret key. |
-| `AWS_REGION` | Variable | Yes | Your EC2 instance's AWS region, e.g. `us-east-1`. |
-| `EC2_INSTANCE_ID` | Variable | Yes | Your instance ID, e.g. `i-0123456789abcdef0`. |
-| `EC2_APP_DIR` | Variable | Yes | Absolute path to the app directory on EC2, e.g. `/home/ubuntu/Replit_porject` — this must already be a `git clone` of this repo (see `IAM_DEPLOYMENT_SETUP.md` §3). |
-| `EC2_HOST` | Variable | Yes | EC2 public IP or domain — used for the public smoke test, not for connecting. |
+| `AWS_REGION` | Variable | Yes | Where the instance is (or will be) provisioned, e.g. `ap-south-1`. |
+| `EC2_NAME_TAG` | Variable | No (default `replit-porject`) | The tag the pipeline searches for / creates the instance with. |
+| `EC2_INSTANCE_TYPE` | Variable | No (default `t3.micro`) | Only used when creating a new instance. |
+| `EC2_INSTANCE_ROLE_PROFILE` | Variable | No (default `Replit-Porject-EC2-SSM-Profile`) | Must match the instance profile from `IAM_DEPLOYMENT_SETUP.md` §3. |
+| `EC2_APP_DIR` | Variable | No (default `/home/ubuntu/Replit_porject`) | Must match the path `deploy/bootstrap-ec2.sh` clones into. |
 | `DEPLOY_BRANCH` | Variable | No (default `main`) | Which branch triggers an actual deploy; pushes to other branches still run `validate` via normal CI but the deploy pipeline no-ops. |
 
-No GHCR-specific secret is needed — the pipeline pushes with the automatic `GITHUB_TOKEN`, and the packages are set to public visibility (see `IAM_DEPLOYMENT_SETUP.md` §6) so EC2 can pull with no registry credential at all.
+No `EC2_INSTANCE_ID` and no `EC2_HOST` — the `provision` job discovers or creates the instance and its stable public IP dynamically on every run, and passes both to the jobs that need them. No GHCR-specific secret is needed either — the pipeline pushes with the automatic `GITHUB_TOKEN`, and the packages are set to public visibility (see `IAM_DEPLOYMENT_SETUP.md` §5) so EC2 can pull with no registry credential at all.
 
-If you have leftover `EC2_SSH_KEY` / `EC2_KNOWN_HOSTS` secrets or `EC2_USER` / `EC2_SSH_PORT` / `DEPLOY_S3_BUCKET` variables from an earlier version of this pipeline, they're unused now and can be deleted.
+If you have leftover `EC2_SSH_KEY` / `EC2_KNOWN_HOSTS` secrets, or `EC2_USER` / `EC2_SSH_PORT` / `DEPLOY_S3_BUCKET` / `EC2_INSTANCE_ID` / `EC2_HOST` variables from an earlier version of this pipeline, they're unused now and can be deleted.
 
 ### 9.4 First run
 
-1. Complete the one-time AWS setup in `IAM_DEPLOYMENT_SETUP.md` (EC2 instance role, git clone on the box, IAM user, GHCR package visibility — no S3) and add the secrets/variables above.
-2. Make sure `EC2_APP_DIR` is a working `git clone` of this repo with a working `compose.yaml` and `deploy/` folder (i.e. you've done the manual first deploy in sections 1–6 at least once) — the pipeline does not bootstrap Docker, Nginx, or the host from scratch.
-3. Push to `main`, or trigger manually: GitHub → repo → **Actions** → **Deploy portfolio to EC2** → **Run workflow**.
-4. Watch the run. Each job (`gate` → `validate` → `build-and-push` → `deploy` → `smoke-test` → `report`) must go green in order. The final **Deployment summary** in the run's job summary shows the deployed commit, image tags, and the live URL.
+1. Complete the one-time AWS setup in `IAM_DEPLOYMENT_SETUP.md` (instance role, IAM user) and add the secrets/variables above — there's no instance to launch by hand, the pipeline creates it.
+2. Push to `main`, or trigger manually: GitHub → repo → **Actions** → **Deploy portfolio to EC2** → **Run workflow**.
+3. Watch the run. The first run's `provision` job takes a few extra minutes (launching the instance and waiting for Docker/Nginx/git to install); every later run reuses the same instance and skips straight through.
+4. Make the GHCR packages public (`IAM_DEPLOYMENT_SETUP.md` §5) — needs the first run to have happened so the packages exist.
+5. Watch the full run go green (`gate`/`provision` → `validate` → `build-and-push` → `deploy` → `smoke-test` → `report`). The final **Deployment summary** shows the instance ID, deployed commit, image tags, and the live URL (a stable Elastic IP that won't change on future runs).
 
 ### 9.5 Rollback
 
 Automatic: if `deploy` or `smoke-test` fails, the `rollback` job runs by itself and reverts EC2 to the last successfully deployed image tags — using images already cached on the box, so it works even if GHCR is briefly unreachable. No data, volumes, or the Nginx config are touched.
 
-Manual (from the EC2 instance, any time):
+Manual, any time — no SSH key or open port needed, just your own AWS CLI access:
 ```bash
-cd <EC2_APP_DIR>
+aws ssm start-session --target <instance-id> --region <region>
+# once in the session:
+cd /home/ubuntu/Replit_porject
 ./deploy/deploy.sh rollback     # reverts to the previous recorded release
 ./deploy/deploy.sh status       # confirm containers are healthy
 ```
+See `IAM_DEPLOYMENT_SETUP.md` §8–9 for the full rollback and recreate-the-instance procedures.
 
 Manual (force a specific older version without waiting for CI): re-run the **Deploy portfolio to EC2** workflow with **Run workflow** → `ref` set to the older commit SHA/branch/tag you want live.
 

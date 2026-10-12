@@ -7,13 +7,16 @@ name: Deploy portfolio to EC2
 # no SSH host-key management needed for CI, and no S3 bucket either: EC2 has
 # its own git clone of this repo and simply `git fetch` + `git checkout`s the
 # exact deployed commit directly from GitHub (public repo, no credentials
-# needed on the server). Before deploying, the pipeline also starts the
-# instance if it's stopped and waits for it to register as SSM-online — if
-# it never comes online, the job fails with a clear error rather than
-# silently falling back to any other access method. See
-# IAM_DEPLOYMENT_SETUP.md for the full setup guide (IAM policy, EC2 instance
-# role, one-time git clone) and AWS_DEPLOYMENT.md for the overall app
-# architecture.
+# needed on the server).
+#
+# The "provision" job finds the EC2 instance by its Name tag (EC2_NAME_TAG)
+# before every run; if none exists yet, it creates one (security group,
+# Elastic IP, IAM instance role attached at launch, deploy/bootstrap-ec2.sh
+# as user-data) and tags it. So the instance is created automatically the
+# first time this pipeline runs, and every run after that just reuses the
+# same tagged instance — nothing to provision by hand. See
+# IAM_DEPLOYMENT_SETUP.md for the full setup guide and AWS_DEPLOYMENT.md for
+# the overall app architecture.
 
 on:
   push:
@@ -64,6 +67,160 @@ jobs:
     needs: gate
     if: needs.gate.outputs.proceed == 'true'
     uses: ./.github/workflows/ci.yml
+
+  # Find the EC2 instance by its Name tag; create it (security group,
+  # Elastic IP, instance role, bootstrap script as user-data) if it doesn't
+  # exist yet. Runs in parallel with validate/build-and-push since it
+  # doesn't depend on the application build. Every job after this one
+  # consumes instance_id/public_ip from here instead of a hand-set variable
+  # — nothing to provision by hand, and nothing recreated on later runs.
+  provision:
+    name: Find or create EC2 instance
+    needs: gate
+    if: needs.gate.outputs.proceed == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      instance_id: ${{ steps.instance.outputs.instance_id }}
+      public_ip: ${{ steps.instance.outputs.public_ip }}
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      EC2_NAME_TAG: ${{ vars.EC2_NAME_TAG || 'replit-porject' }}
+      EC2_INSTANCE_TYPE: ${{ vars.EC2_INSTANCE_TYPE || 't3.micro' }}
+      EC2_INSTANCE_ROLE_PROFILE: ${{ vars.EC2_INSTANCE_ROLE_PROFILE || 'Replit-Porject-EC2-SSM-Profile' }}
+    steps:
+      - name: Validate provisioning settings
+        shell: bash
+        run: |
+          [[ -n "$AWS_REGION" ]] || { echo "Set repository variable AWS_REGION."; exit 1; }
+          [[ -n "${{ secrets.AWS_ACCESS_KEY_ID }}" ]] || { echo "Set repository secret AWS_ACCESS_KEY_ID."; exit 1; }
+          [[ -n "${{ secrets.AWS_SECRET_ACCESS_KEY }}" ]] || { echo "Set repository secret AWS_SECRET_ACCESS_KEY."; exit 1; }
+
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Find existing instance, or create one
+        id: instance
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          instance_id=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=$EC2_NAME_TAG" \
+                      "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+            --query "Reservations[0].Instances[0].InstanceId" --output text)
+
+          if [[ "$instance_id" == "None" || -z "$instance_id" ]]; then
+            echo "No existing instance tagged Name=$EC2_NAME_TAG — creating one."
+
+            vpc_id=$(aws ec2 describe-vpcs --filters "Name=isDefault,Values=true" --query "Vpcs[0].VpcId" --output text)
+            [[ "$vpc_id" != "None" && -n "$vpc_id" ]] || { echo "::error::No default VPC found in $AWS_REGION. Create a VPC or set one up manually, then set EC2_INSTANCE_ID yourself."; exit 1; }
+
+            sg_name="${EC2_NAME_TAG}-sg"
+            sg_id=$(aws ec2 describe-security-groups \
+              --filters "Name=group-name,Values=$sg_name" "Name=vpc-id,Values=$vpc_id" \
+              --query "SecurityGroups[0].GroupId" --output text)
+            if [[ "$sg_id" == "None" || -z "$sg_id" ]]; then
+              echo "Creating security group $sg_name (inbound 80/443 only — no SSH port; use 'aws ssm start-session' for shell access)."
+              sg_id=$(aws ec2 create-security-group \
+                --group-name "$sg_name" \
+                --description "Developer portfolio app server (HTTP/HTTPS only, SSM for access)" \
+                --vpc-id "$vpc_id" \
+                --query "GroupId" --output text)
+              aws ec2 authorize-security-group-ingress --group-id "$sg_id" --protocol tcp --port 80 --cidr 0.0.0.0/0 >/dev/null
+              aws ec2 authorize-security-group-ingress --group-id "$sg_id" --protocol tcp --port 443 --cidr 0.0.0.0/0 >/dev/null
+            fi
+
+            ami_id=$(aws ssm get-parameters \
+              --names /aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id \
+              --query "Parameters[0].Value" --output text)
+            echo "Using Ubuntu 24.04 AMI: $ami_id"
+
+            instance_id=$(aws ec2 run-instances \
+              --image-id "$ami_id" \
+              --instance-type "$EC2_INSTANCE_TYPE" \
+              --security-group-ids "$sg_id" \
+              --iam-instance-profile "Name=$EC2_INSTANCE_ROLE_PROFILE" \
+              --user-data "file://deploy/bootstrap-ec2.sh" \
+              --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$EC2_NAME_TAG}]" \
+              --count 1 \
+              --query "Instances[0].InstanceId" --output text)
+            echo "Created instance $instance_id. First boot runs deploy/bootstrap-ec2.sh (Docker, Nginx, git clone) — this can take a few minutes."
+          else
+            echo "Reusing existing instance $instance_id (tagged Name=$EC2_NAME_TAG)."
+          fi
+
+          echo "instance_id=$instance_id" >> "$GITHUB_OUTPUT"
+
+          aws ec2 wait instance-running --instance-ids "$instance_id"
+          aws ec2 wait instance-status-ok --instance-ids "$instance_id"
+
+          alloc_id=$(aws ec2 describe-addresses \
+            --filters "Name=tag:Name,Values=$EC2_NAME_TAG" \
+            --query "Addresses[0].AllocationId" --output text)
+          if [[ "$alloc_id" == "None" || -z "$alloc_id" ]]; then
+            echo "Allocating a new Elastic IP (keeps the public IP stable across stop/start or instance replacement)."
+            alloc_id=$(aws ec2 allocate-address \
+              --domain vpc \
+              --tag-specifications "ResourceType=elastic-ip,Tags=[{Key=Name,Value=$EC2_NAME_TAG}]" \
+              --query "AllocationId" --output text)
+          fi
+          aws ec2 associate-address --instance-id "$instance_id" --allocation-id "$alloc_id" >/dev/null
+          public_ip=$(aws ec2 describe-addresses --allocation-ids "$alloc_id" --query "Addresses[0].PublicIp" --output text)
+          echo "public_ip=$public_ip" >> "$GITHUB_OUTPUT"
+          echo "Instance $instance_id is running at $public_ip."
+
+          echo "Waiting for SSM PingStatus to become Online..."
+          ssm_online=false
+          for i in $(seq 1 30); do
+            ping_status=$(aws ssm describe-instance-information \
+              --filters "Key=InstanceIds,Values=$instance_id" \
+              --query "InstanceInformationList[0].PingStatus" --output text 2>/dev/null || echo "Unknown")
+            echo "Attempt $i/30: PingStatus=$ping_status"
+            if [[ "$ping_status" == "Online" ]]; then
+              ssm_online=true
+              break
+            fi
+            sleep 10
+          done
+          if [[ "$ssm_online" != "true" ]]; then
+            echo "::error::Instance $instance_id did not register as SSM-online in time. If this is a brand-new instance, check that EC2_INSTANCE_ROLE_PROFILE ($EC2_INSTANCE_ROLE_PROFILE) exists and has AmazonSSMManagedInstanceCore attached (IAM_DEPLOYMENT_SETUP.md section 4). If it's a reused instance, see section 10 troubleshooting."
+            exit 1
+          fi
+
+          echo "Waiting for first-boot bootstrap (cloud-init) to finish — only takes real time on a brand-new instance..."
+          params_file="$(mktemp)"
+          jq -n '{commands: ["cloud-init status --wait"]}' > "$params_file"
+          command_id=$(aws ssm send-command \
+            --instance-ids "$instance_id" \
+            --document-name "AWS-RunShellScript" \
+            --comment "Wait for bootstrap" \
+            --parameters "file://$params_file" \
+            --query "Command.CommandId" --output text)
+          status="Pending"
+          for i in $(seq 1 60); do
+            sleep 10
+            status=$(aws ssm get-command-invocation \
+              --command-id "$command_id" --instance-id "$instance_id" \
+              --query "Status" --output text 2>/dev/null || echo "Pending")
+            if [[ "$status" == "Success" || "$status" == "Failed" || "$status" == "Cancelled" || "$status" == "TimedOut" ]]; then
+              break
+            fi
+          done
+          if [[ "$status" != "Success" ]]; then
+            echo "::error::Bootstrap (cloud-init) did not finish successfully (status: $status). Check /var/log/replit-porject-bootstrap.log on the instance via 'aws ssm start-session'."
+            aws ssm get-command-invocation --command-id "$command_id" --instance-id "$instance_id" --query "StandardOutputContent" --output text || true
+            exit 1
+          fi
+          echo "Bootstrap confirmed complete."
 
   # Stage 2: build both images once on the runner and push to GHCR, tagged
   # with the exact commit SHA that passed validation.
@@ -136,21 +293,18 @@ jobs:
   # Stage 3: use AWS Systems Manager Run Command to have EC2 fetch the exact
   # deployed commit directly from GitHub (git fetch + checkout — the repo is
   # public, so no credential is needed on the server) and run pull-deploy.
-  # No SSH, no S3, no file transfer of any kind — the IAM user authenticated
-  # via aws-actions/configure-aws-credentials only has permission to call SSM
-  # (plus the minimum EC2/SSM describe/start actions needed to wake a stopped
-  # instance) on this one instance, nothing else — see
-  # IAM_DEPLOYMENT_SETUP.md for the exact policy.
+  # No SSH, no S3, no file transfer of any kind. The instance is guaranteed
+  # running and SSM-managed already by the "provision" job above.
   deploy:
     name: Deploy to EC2 (via AWS SSM)
-    needs: [gate, build-and-push]
+    needs: [gate, provision, build-and-push]
     if: needs.gate.outputs.proceed == 'true'
     runs-on: ubuntu-latest
     environment: production
     env:
       AWS_REGION: ${{ vars.AWS_REGION }}
-      EC2_INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID }}
-      EC2_APP_DIR: ${{ vars.EC2_APP_DIR }}
+      EC2_INSTANCE_ID: ${{ needs.provision.outputs.instance_id }}
+      EC2_APP_DIR: ${{ vars.EC2_APP_DIR || '/home/ubuntu/Replit_porject' }}
       API_IMAGE: ${{ needs.build-and-push.outputs.api_image }}
       WEB_IMAGE: ${{ needs.build-and-push.outputs.web_image }}
       COMMIT_SHA: ${{ needs.build-and-push.outputs.commit_sha }}
@@ -159,8 +313,7 @@ jobs:
         shell: bash
         run: |
           [[ -n "$AWS_REGION" ]] || { echo "Set repository variable AWS_REGION."; exit 1; }
-          [[ -n "$EC2_INSTANCE_ID" ]] || { echo "Set repository variable EC2_INSTANCE_ID (e.g. i-0123456789abcdef0)."; exit 1; }
-          [[ -n "$EC2_APP_DIR" ]] || { echo "Set repository variable EC2_APP_DIR (e.g. /home/ubuntu/Replit_porject)."; exit 1; }
+          [[ -n "$EC2_INSTANCE_ID" ]] || { echo "::error::provision job did not output an instance_id."; exit 1; }
           [[ -n "${{ secrets.AWS_ACCESS_KEY_ID }}" ]] || { echo "Set repository secret AWS_ACCESS_KEY_ID."; exit 1; }
           [[ -n "${{ secrets.AWS_SECRET_ACCESS_KEY }}" ]] || { echo "Set repository secret AWS_SECRET_ACCESS_KEY."; exit 1; }
 
@@ -170,55 +323,6 @@ jobs:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
-
-      - name: Ensure EC2 instance is running and SSM-managed
-        shell: bash
-        run: |
-          set -euo pipefail
-          state=$(aws ec2 describe-instances \
-            --instance-ids "$EC2_INSTANCE_ID" \
-            --query "Reservations[0].Instances[0].State.Name" \
-            --output text)
-          echo "Current EC2 state: $state"
-
-          case "$state" in
-            running)
-              ;;
-            pending)
-              echo "EC2 instance is pending; waiting for running state."
-              ;;
-            stopped|stopping)
-              echo "Starting EC2 instance $EC2_INSTANCE_ID..."
-              aws ec2 start-instances --instance-ids "$EC2_INSTANCE_ID" --output text >/dev/null
-              ;;
-            *)
-              echo "::error::EC2 instance $EC2_INSTANCE_ID is in unsupported state '$state' for deployment."
-              exit 1
-              ;;
-          esac
-
-          aws ec2 wait instance-running --instance-ids "$EC2_INSTANCE_ID"
-          aws ec2 wait instance-status-ok --instance-ids "$EC2_INSTANCE_ID"
-
-          ssm_online=false
-          echo "Waiting for SSM PingStatus to become Online..."
-          for i in $(seq 1 30); do
-            ping_status=$(aws ssm describe-instance-information \
-              --filters "Key=InstanceIds,Values=$EC2_INSTANCE_ID" \
-              --query "InstanceInformationList[0].PingStatus" \
-              --output text 2>/dev/null || echo "Unknown")
-            echo "Attempt $i/30: PingStatus=$ping_status"
-            if [[ "$ping_status" == "Online" ]]; then
-              ssm_online=true
-              break
-            fi
-            sleep 10
-          done
-
-          if [[ "$ssm_online" != "true" ]]; then
-            echo "::error::EC2 instance $EC2_INSTANCE_ID did not register as SSM-online in time. Check IAM_DEPLOYMENT_SETUP.md section 4 (instance role) and 4.1 (SSM Agent status)."
-            exit 1
-          fi
 
       - name: Run pull-based deployment via SSM
         shell: bash
@@ -279,11 +383,11 @@ jobs:
   # path (host Nginx on port 80), not just healthy from inside EC2.
   smoke-test:
     name: Public smoke test
-    needs: [gate, deploy]
+    needs: [gate, provision, deploy]
     if: needs.gate.outputs.proceed == 'true'
     runs-on: ubuntu-latest
     env:
-      EC2_HOST: ${{ vars.EC2_HOST }}
+      EC2_HOST: ${{ needs.provision.outputs.public_ip }}
     steps:
       - name: Probe public endpoints with bounded retries
         shell: bash
@@ -308,13 +412,13 @@ jobs:
   # revert EC2 to the last known-good images. Never deletes volumes/data.
   rollback:
     name: Rollback to previous release
-    needs: [gate, deploy, smoke-test]
+    needs: [gate, provision, deploy, smoke-test]
     if: always() && needs.gate.outputs.proceed == 'true' && (needs.deploy.result == 'failure' || needs.smoke-test.result == 'failure')
     runs-on: ubuntu-latest
     env:
       AWS_REGION: ${{ vars.AWS_REGION }}
-      EC2_INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID }}
-      EC2_APP_DIR: ${{ vars.EC2_APP_DIR }}
+      EC2_INSTANCE_ID: ${{ needs.provision.outputs.instance_id }}
+      EC2_APP_DIR: ${{ vars.EC2_APP_DIR || '/home/ubuntu/Replit_porject' }}
     steps:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
@@ -323,55 +427,9 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Ensure EC2 instance is running and SSM-managed
-        shell: bash
-        run: |
-          set -euo pipefail
-          state=$(aws ec2 describe-instances \
-            --instance-ids "$EC2_INSTANCE_ID" \
-            --query "Reservations[0].Instances[0].State.Name" \
-            --output text)
-          echo "Current EC2 state: $state"
-
-          case "$state" in
-            running)
-              ;;
-            pending)
-              echo "EC2 instance is pending; waiting for running state."
-              ;;
-            stopped|stopping)
-              echo "Starting EC2 instance $EC2_INSTANCE_ID..."
-              aws ec2 start-instances --instance-ids "$EC2_INSTANCE_ID" --output text >/dev/null
-              ;;
-            *)
-              echo "::error::EC2 instance $EC2_INSTANCE_ID is in unsupported state '$state' for rollback."
-              exit 1
-              ;;
-          esac
-
-          aws ec2 wait instance-running --instance-ids "$EC2_INSTANCE_ID"
-          aws ec2 wait instance-status-ok --instance-ids "$EC2_INSTANCE_ID"
-
-          ssm_online=false
-          echo "Waiting for SSM PingStatus to become Online..."
-          for i in $(seq 1 30); do
-            ping_status=$(aws ssm describe-instance-information \
-              --filters "Key=InstanceIds,Values=$EC2_INSTANCE_ID" \
-              --query "InstanceInformationList[0].PingStatus" \
-              --output text 2>/dev/null || echo "Unknown")
-            echo "Attempt $i/30: PingStatus=$ping_status"
-            if [[ "$ping_status" == "Online" ]]; then
-              ssm_online=true
-              break
-            fi
-            sleep 10
-          done
-
-          if [[ "$ssm_online" != "true" ]]; then
-            echo "::error::EC2 instance $EC2_INSTANCE_ID did not register as SSM-online in time. Check IAM_DEPLOYMENT_SETUP.md section 4 (instance role) and 4.1 (SSM Agent status)."
-            exit 1
-          fi
-
+      # No readiness check needed here — the provision job already confirmed
+      # this instance is running and SSM-managed earlier in this same run,
+      # moments before `deploy` used it.
       - name: Roll back EC2 to previous release via SSM
         shell: bash
         run: |
@@ -424,7 +482,7 @@ jobs:
   # what shipped and whether it's actually live.
   report:
     name: Deployment summary
-    needs: [gate, build-and-push, deploy, smoke-test, rollback]
+    needs: [gate, provision, build-and-push, deploy, smoke-test, rollback]
     if: always() && needs.gate.outputs.proceed == 'true'
     runs-on: ubuntu-latest
     steps:
@@ -435,6 +493,7 @@ jobs:
             echo ""
             echo "| Item | Value |"
             echo "|---|---|"
+            echo "| Instance | \`${{ needs.provision.outputs.instance_id || 'not provisioned' }}\` |"
             echo "| Commit | \`${{ needs.build-and-push.outputs.commit_sha || github.sha }}\` |"
             echo "| API image | \`${{ needs.build-and-push.outputs.api_image || 'not built' }}\` |"
             echo "| Web image | \`${{ needs.build-and-push.outputs.web_image || 'not built' }}\` |"
@@ -444,7 +503,7 @@ jobs:
             echo "| Rollback | ${{ needs.rollback.result }} |"
             if [[ "${{ needs.deploy.result }}" == "success" && "${{ needs.smoke-test.result }}" == "success" ]]; then
               echo ""
-              echo "**Live at http://${{ vars.EC2_HOST }}/**"
+              echo "**Live at http://${{ needs.provision.outputs.public_ip }}/**"
             elif [[ "${{ needs.rollback.result }}" == "success" ]]; then
               echo ""
               echo "**Deployment failed and was automatically rolled back. Site should still be serving the previous release.**"
