@@ -4,11 +4,12 @@ name: Deploy portfolio to EC2
 # GitHub Container Registry (GHCR) tagged with the exact commit SHA. An IAM
 # user authenticates GitHub Actions to AWS; deployment itself runs over AWS
 # Systems Manager (SSM) Run Command, not SSH — no SSH key, no open port 22,
-# no SSH host-key management needed for CI. The small deploy config
-# (compose.yaml + deploy/) travels via a private S3 bucket because SSM Run
-# Command has no file-transfer primitive of its own. See
-# IAM_DEPLOYMENT_SETUP.md for the full setup guide (IAM policy, S3 bucket,
-# instance role) and AWS_DEPLOYMENT.md for the overall app architecture.
+# no SSH host-key management needed for CI, and no S3 bucket either: EC2 has
+# its own git clone of this repo and simply `git fetch` + `git checkout`s the
+# exact deployed commit directly from GitHub (public repo, no credentials
+# needed on the server). See IAM_DEPLOYMENT_SETUP.md for the full setup guide
+# (IAM policy, EC2 instance role, one-time git clone) and AWS_DEPLOYMENT.md
+# for the overall app architecture.
 
 on:
   push:
@@ -128,12 +129,13 @@ jobs:
           cache-from: type=gha,scope=web
           cache-to: type=gha,mode=max,scope=web
 
-  # Stage 3: upload the small deploy config (compose.yaml + deploy/) to a
-  # private S3 bucket, then use AWS Systems Manager Run Command to have EC2
-  # fetch it and run pull-deploy. No SSH involved. The IAM user authenticated
+  # Stage 3: use AWS Systems Manager Run Command to have EC2 fetch the exact
+  # deployed commit directly from GitHub (git fetch + checkout — the repo is
+  # public, so no credential is needed on the server) and run pull-deploy.
+  # No SSH, no S3, no file transfer of any kind — the IAM user authenticated
   # via aws-actions/configure-aws-credentials only has permission to call SSM
-  # on this one instance and write to this one S3 prefix — see
-  # IAM_DEPLOYMENT_SETUP.md for the exact policy.
+  # on this one instance, nothing else — see IAM_DEPLOYMENT_SETUP.md for the
+  # exact policy.
   deploy:
     name: Deploy to EC2 (via AWS SSM)
     needs: [gate, build-and-push]
@@ -144,7 +146,6 @@ jobs:
       AWS_REGION: ${{ vars.AWS_REGION }}
       EC2_INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID }}
       EC2_APP_DIR: ${{ vars.EC2_APP_DIR }}
-      DEPLOY_S3_BUCKET: ${{ vars.DEPLOY_S3_BUCKET }}
       API_IMAGE: ${{ needs.build-and-push.outputs.api_image }}
       WEB_IMAGE: ${{ needs.build-and-push.outputs.web_image }}
       COMMIT_SHA: ${{ needs.build-and-push.outputs.commit_sha }}
@@ -155,14 +156,8 @@ jobs:
           [[ -n "$AWS_REGION" ]] || { echo "Set repository variable AWS_REGION."; exit 1; }
           [[ -n "$EC2_INSTANCE_ID" ]] || { echo "Set repository variable EC2_INSTANCE_ID (e.g. i-0123456789abcdef0)."; exit 1; }
           [[ -n "$EC2_APP_DIR" ]] || { echo "Set repository variable EC2_APP_DIR (e.g. /home/ubuntu/Replit_porject)."; exit 1; }
-          [[ -n "$DEPLOY_S3_BUCKET" ]] || { echo "Set repository variable DEPLOY_S3_BUCKET."; exit 1; }
           [[ -n "${{ secrets.AWS_ACCESS_KEY_ID }}" ]] || { echo "Set repository secret AWS_ACCESS_KEY_ID."; exit 1; }
           [[ -n "${{ secrets.AWS_SECRET_ACCESS_KEY }}" ]] || { echo "Set repository secret AWS_SECRET_ACCESS_KEY."; exit 1; }
-
-      - name: Check out deploy configuration
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          ref: ${{ github.event.inputs.ref || github.ref }}
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
@@ -171,29 +166,23 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Upload deploy config to S3
-        shell: bash
-        run: |
-          set -euo pipefail
-          tar -czf /tmp/deploy-config.tgz compose.yaml deploy
-          aws s3 cp /tmp/deploy-config.tgz "s3://$DEPLOY_S3_BUCKET/releases/$COMMIT_SHA.tgz"
-
       - name: Run pull-based deployment via SSM
         shell: bash
         run: |
           set -euo pipefail
 
-          # Built as a bash array (these values aren't secret: bucket name,
-          # app dir, image tags, commit SHA), then passed to jq --args so the
-          # SSM RunShellScript document gets a clean, correctly escaped
-          # command list with no manual JSON quoting.
+          # Built as a bash array (none of this is secret: app dir, image
+          # tags, commit SHA), then passed to jq --args so the SSM
+          # RunShellScript document gets a clean, correctly escaped command
+          # list with no manual JSON quoting.
           remote_lines=(
             'set -Eeuo pipefail'
             "mkdir -p \"$EC2_APP_DIR\""
             "cd \"$EC2_APP_DIR\""
-            "aws s3 cp \"s3://$DEPLOY_S3_BUCKET/releases/$COMMIT_SHA.tgz\" /tmp/deploy-config.tgz"
-            "tar -xzf /tmp/deploy-config.tgz -C \"$EC2_APP_DIR\""
-            'rm -f /tmp/deploy-config.tgz'
+            '[ -d .git ] || { echo "ERROR: $PWD is not a git clone yet. See IAM_DEPLOYMENT_SETUP.md for the one-time git clone step." >&2; exit 1; }'
+            'git fetch origin'
+            "git checkout --force \"$COMMIT_SHA\""
+            'git clean -fd'
             'chmod +x deploy/deploy.sh'
             "API_IMAGE=\"$API_IMAGE\" WEB_IMAGE=\"$WEB_IMAGE\" ./deploy/deploy.sh pull-deploy"
           )

@@ -274,31 +274,30 @@ push to main
 - EC2 only needs `compose.yaml` and the `deploy/` folder — not the whole monorepo — so deploys are smaller.
 - GitHub Container Registry (GHCR) is part of GitHub itself; no Docker Hub account needed.
 
-**The `deploy` stage uses an IAM user + AWS Systems Manager (SSM), not SSH.** GitHub Actions authenticates to AWS with a dedicated IAM user's access keys, uploads the small deploy config to a private S3 bucket, then runs `deploy/deploy.sh pull-deploy` on the instance via `aws ssm send-command` — no SSH key, no open port 22 for CI, no SSH host-key management.
+**The `deploy` stage uses an IAM user + AWS Systems Manager (SSM), not SSH — and no S3 or any other file transfer either.** GitHub Actions authenticates to AWS with a dedicated IAM user's access keys and runs `aws ssm send-command` to tell the instance to `git fetch` + `git checkout` the exact deployed commit directly from GitHub (this repo is public, so no credential is needed on the server for that) and then run `deploy/deploy.sh pull-deploy`. No SSH key, no open port 22 for CI, no SSH host-key management, no extra AWS storage.
 
-**Full setup walkthrough — IAM policy, S3 bucket, EC2 instance role, exact commands: see `IAM_DEPLOYMENT_SETUP.md`.** That's the file to follow end to end for setting up the credentials below. This section only summarizes the result.
+**Full setup walkthrough — IAM policy, EC2 instance role, the one-time git clone, exact commands: see `IAM_DEPLOYMENT_SETUP.md`.** That's the file to follow end to end for setting up the credentials below. This section only summarizes the result.
 
 ### 9.1 GitHub Secrets and Variables
 
 | Name | Kind | Required | Purpose |
 |---|---|---|---|
-| `AWS_ACCESS_KEY_ID` | Secret | Yes | IAM user access key (see `IAM_DEPLOYMENT_SETUP.md` §3.4). |
+| `AWS_ACCESS_KEY_ID` | Secret | Yes | IAM user access key (see `IAM_DEPLOYMENT_SETUP.md` §5). |
 | `AWS_SECRET_ACCESS_KEY` | Secret | Yes | IAM user secret key. |
 | `AWS_REGION` | Variable | Yes | Your EC2 instance's AWS region, e.g. `us-east-1`. |
 | `EC2_INSTANCE_ID` | Variable | Yes | Your instance ID, e.g. `i-0123456789abcdef0`. |
-| `EC2_APP_DIR` | Variable | Yes | Absolute path to the app directory on EC2, e.g. `/home/ubuntu/Replit_porject`. |
-| `DEPLOY_S3_BUCKET` | Variable | Yes | The private S3 bucket deploy config is staged through. |
+| `EC2_APP_DIR` | Variable | Yes | Absolute path to the app directory on EC2, e.g. `/home/ubuntu/Replit_porject` — this must already be a `git clone` of this repo (see `IAM_DEPLOYMENT_SETUP.md` §3). |
 | `EC2_HOST` | Variable | Yes | EC2 public IP or domain — used for the public smoke test, not for connecting. |
 | `DEPLOY_BRANCH` | Variable | No (default `main`) | Which branch triggers an actual deploy; pushes to other branches still run `validate` via normal CI but the deploy pipeline no-ops. |
 
-No GHCR-specific secret is needed — the pipeline pushes with the automatic `GITHUB_TOKEN`, and the packages are set to public visibility (see `IAM_DEPLOYMENT_SETUP.md` §3.5) so EC2 can pull with no registry credential at all.
+No GHCR-specific secret is needed — the pipeline pushes with the automatic `GITHUB_TOKEN`, and the packages are set to public visibility (see `IAM_DEPLOYMENT_SETUP.md` §6) so EC2 can pull with no registry credential at all.
 
-If you have leftover `EC2_SSH_KEY` / `EC2_KNOWN_HOSTS` secrets or `EC2_USER` / `EC2_SSH_PORT` variables from an earlier SSH-based version of this pipeline, they're unused now and can be deleted.
+If you have leftover `EC2_SSH_KEY` / `EC2_KNOWN_HOSTS` secrets or `EC2_USER` / `EC2_SSH_PORT` / `DEPLOY_S3_BUCKET` variables from an earlier version of this pipeline, they're unused now and can be deleted.
 
 ### 9.4 First run
 
-1. Complete the one-time AWS setup in `IAM_DEPLOYMENT_SETUP.md` (S3 bucket, EC2 instance role, IAM user, GHCR package visibility) and add the secrets/variables above.
-2. Make sure `EC2_APP_DIR` already exists on EC2 with a working `compose.yaml` and `deploy/` folder (i.e. you've done the manual first deploy in sections 1–6 at least once) — the pipeline only ever syncs `compose.yaml` and `deploy/`, it does not bootstrap Docker, Nginx, or the host from scratch.
+1. Complete the one-time AWS setup in `IAM_DEPLOYMENT_SETUP.md` (EC2 instance role, git clone on the box, IAM user, GHCR package visibility — no S3) and add the secrets/variables above.
+2. Make sure `EC2_APP_DIR` is a working `git clone` of this repo with a working `compose.yaml` and `deploy/` folder (i.e. you've done the manual first deploy in sections 1–6 at least once) — the pipeline does not bootstrap Docker, Nginx, or the host from scratch.
 3. Push to `main`, or trigger manually: GitHub → repo → **Actions** → **Deploy portfolio to EC2** → **Run workflow**.
 4. Watch the run. Each job (`gate` → `validate` → `build-and-push` → `deploy` → `smoke-test` → `report`) must go green in order. The final **Deployment summary** in the run's job summary shows the deployed commit, image tags, and the live URL.
 
