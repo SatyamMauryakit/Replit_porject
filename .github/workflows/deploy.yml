@@ -121,6 +121,26 @@ jobs:
           if [[ "$instance_id" == "None" || -z "$instance_id" ]]; then
             echo "No existing instance tagged Name=$EC2_NAME_TAG — creating one."
 
+            # Check this up front with a clear error — otherwise it only
+            # surfaces as a confusing "Invalid IAM Instance Profile name"
+            # error deep inside run-instances. Retries a few times since a
+            # just-created instance profile can take a few seconds to
+            # propagate before EC2 can see it.
+            echo "Checking that instance profile $EC2_INSTANCE_ROLE_PROFILE exists..."
+            profile_found=false
+            for i in $(seq 1 6); do
+              if aws iam get-instance-profile --instance-profile-name "$EC2_INSTANCE_ROLE_PROFILE" >/dev/null 2>&1; then
+                profile_found=true
+                break
+              fi
+              echo "Not visible yet (attempt $i/6), waiting 10s for IAM propagation..."
+              sleep 10
+            done
+            if [[ "$profile_found" != "true" ]]; then
+              echo "::error::IAM instance profile '$EC2_INSTANCE_ROLE_PROFILE' does not exist in this AWS account (or isn't visible yet). Create it first — IAM_DEPLOYMENT_SETUP.md section 3 (aws iam create-role / create-instance-profile / add-role-to-instance-profile). If you just created it, wait ~30 seconds and re-run this workflow."
+              exit 1
+            fi
+
             vpc_id=$(aws ec2 describe-vpcs --filters "Name=isDefault,Values=true" --query "Vpcs[0].VpcId" --output text)
             [[ "$vpc_id" != "None" && -n "$vpc_id" ]] || { echo "::error::No default VPC found in $AWS_REGION. Create a VPC or set one up manually, then set EC2_INSTANCE_ID yourself."; exit 1; }
 

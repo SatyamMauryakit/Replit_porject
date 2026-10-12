@@ -208,6 +208,12 @@ cat > /tmp/github-actions-policy.json <<EOF
       "Effect": "Allow",
       "Action": "iam:PassRole",
       "Resource": "arn:aws:iam::$ACCOUNT_ID:role/Replit-Porject-EC2-SSM-Role"
+    },
+    {
+      "Sid": "VerifyInstanceProfileExistsBeforeLaunch",
+      "Effect": "Allow",
+      "Action": "iam:GetInstanceProfile",
+      "Resource": "arn:aws:iam::$ACCOUNT_ID:instance-profile/Replit-Porject-EC2-SSM-Profile"
     }
   ]
 }
@@ -223,7 +229,7 @@ aws iam put-user-policy \
 - `ec2:StartInstances` and `ssm:SendCommand` on an instance are restricted to instances tagged `Name=replit-porject` — this IAM user cannot start or send commands to any *other* EC2 instance in your account, even though the resource ARN is a wildcard (tag-based conditions, not ARN-based, since the instance ID isn't known in advance).
 - `ec2:RunInstances` requires launching with that same `Name=replit-porject` tag (`aws:RequestTag` condition) — it can't be used to quietly launch an untagged or differently-named instance. It does need `Resource: "*"` — AWS's `RunInstances` resource-level permission model spans several sub-resource types (AMI, subnet, security group, network interface, volume) and doesn't support narrowing all of those to a not-yet-existing instance.
 - `ec2:DescribeInstances`/`DescribeInstanceStatus`/`DescribeVpcs`/`DescribeSecurityGroups`/`DescribeAddresses` are read-only, account-wide by AWS's design (Describe* actions don't support resource-level permissions) — this user can *see* your other EC2 resources exist, but can't change, stop, terminate, or read data from them.
-- `iam:PassRole` is scoped to exactly the one instance role created in §3 — this user cannot pass any other role to anything.
+- `iam:PassRole` and `iam:GetInstanceProfile` are both scoped to exactly the one instance role/profile created in §3 — this user cannot pass or inspect any other role in your account. Note: this user cannot *create* roles or instance profiles (no `iam:CreateRole`, no `iam:AttachRolePolicy`) — letting a CI credential create and attach its own IAM roles is a well-known privilege-escalation pattern, so that step stays manual, done once by you with your own admin credentials (§3).
 
 If you'd rather not grant `ec2:RunInstances`/security-group/Elastic-IP permissions at all, don't use the auto-provisioning path — go back to manually launching the instance once (the older, simpler, more tightly-scoped version of this guide) and just keep the `EC2_INSTANCE_ID` variable pinned; ask and this can be reverted.
 
