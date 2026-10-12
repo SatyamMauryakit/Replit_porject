@@ -29,9 +29,15 @@ Both are required — the IAM user alone can't make SSM Run Command work if the 
 ```
 GitHub Actions workflow
    │
-   │  aws ssm send-command
-   │  "git fetch origin && git checkout <exact commit sha> && deploy/deploy.sh pull-deploy"
-   │  (using IAM user access keys — this is the ONLY AWS permission it needs)
+   │  1. aws ec2 describe-instances / start-instances (only if stopped)
+   │     aws ec2 wait instance-running / instance-status-ok
+   │     aws ssm describe-instance-information (wait for PingStatus=Online)
+   │     — fails the job with a clear error if the instance never comes
+   │       online, instead of falling back to any other access method
+   ▼
+   │  2. aws ssm send-command
+   │     "git fetch origin && git checkout <exact commit sha> && deploy/deploy.sh pull-deploy"
+   │  (using IAM user access keys — this is the ONLY credential involved anywhere)
    ▼
 EC2 instance (SSM Agent + instance role, already has its own git clone of this repo)
    │
@@ -41,7 +47,7 @@ EC2 instance (SSM Agent + instance role, already has its own git clone of this r
 docker compose pull (images from GHCR, public) + up
 ```
 
-No inbound connection from GitHub to EC2 at all, and no AWS storage service involved — the EC2 instance's SSM Agent makes an outbound connection to AWS Systems Manager and polls for commands; `git fetch` is a plain outbound HTTPS call to github.com, same as `git pull` on any machine.
+No inbound connection from GitHub to EC2 at all, and no AWS storage service involved — the EC2 instance's SSM Agent makes an outbound connection to AWS Systems Manager and polls for commands; `git fetch` is a plain outbound HTTPS call to github.com, same as `git pull` on any machine. Step 1 means a stopped instance (e.g. shut down to save cost) gets started automatically before every deploy and rollback — you don't have to remember to turn it on first.
 
 ---
 
@@ -172,7 +178,7 @@ aws ssm describe-instance-information \
   --filters "Key=InstanceIds,Values=$EC2_INSTANCE_ID" \
   --region "$REGION"
 ```
-You must see one entry with `"PingStatus": "Online"` before continuing. If the list is empty, see Troubleshooting (§7) — nothing past this point works until the instance shows up here.
+You must see one entry with `"PingStatus": "Online"` before continuing. If the list is empty, see Troubleshooting (§10) — nothing past this point works until the instance shows up here.
 
 ---
 
@@ -205,6 +211,24 @@ cat > /tmp/github-actions-policy.json <<EOF
       "Effect": "Allow",
       "Action": ["ssm:GetCommandInvocation", "ssm:ListCommandInvocations"],
       "Resource": "*"
+    },
+    {
+      "Sid": "WaitForSSMOnline",
+      "Effect": "Allow",
+      "Action": "ssm:DescribeInstanceInformation",
+      "Resource": "*"
+    },
+    {
+      "Sid": "DescribeInstanceForReadiness",
+      "Effect": "Allow",
+      "Action": ["ec2:DescribeInstances", "ec2:DescribeInstanceStatus"],
+      "Resource": "*"
+    },
+    {
+      "Sid": "StartStoppedInstance",
+      "Effect": "Allow",
+      "Action": "ec2:StartInstances",
+      "Resource": "arn:aws:ec2:$REGION:$ACCOUNT_ID:instance/$EC2_INSTANCE_ID"
     }
   ]
 }
@@ -216,7 +240,7 @@ aws iam put-user-policy \
   --policy-document file:///tmp/github-actions-policy.json
 ```
 
-This is the entire policy — four actions, scoped to exactly one instance and one SSM document. No S3, no EC2 management, no IAM, nothing else in your account. This IAM user can do exactly one thing: tell this one instance to run a shell command, and read the result back.
+This is the entire policy. It lets this IAM user do exactly four things, nothing else in your account: check this one instance's power/status state, start it if it's stopped, confirm it's registered with Systems Manager, and send it a shell command (reading the result back). No S3, no ability to stop/terminate/modify the instance, no IAM, no other EC2 instance, nothing else.
 
 Generate the access key (shown **once** — copy both values immediately):
 ```bash
@@ -312,6 +336,8 @@ Manual, the simplest way if you still have your own SSH access to the box: `ssh`
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
+| "Ensure EC2 instance is running and SSM-managed" step fails on `AccessDeniedException` for `ec2:DescribeInstances`/`ec2:StartInstances` | IAM user policy missing those statements, or the `ec2:StartInstances` resource ARN doesn't match | Re-check the full policy in §5 was applied (`aws iam get-user-policy --user-name github-actions-deploy --policy-name GitHubActionsDeployPolicy`), and the ARN matches `$REGION`/`$ACCOUNT_ID`/`$EC2_INSTANCE_ID` exactly |
+| Instance stays in `pending` until the step times out | Normal AWS boot time occasionally exceeds the wait, or the instance type/AMI is unusually slow to boot | Re-run the workflow — `aws ec2 wait instance-running` already retries for several minutes; if it's consistently slow, that's worth investigating on its own (instance health, AMI choice) |
 | `aws ssm describe-instance-information` returns an empty list | Instance role not attached, or SSM Agent not running | Re-check §4 and §4.1; confirm the instance has outbound internet access (or VPC endpoints for `ssm`, `ssmmessages`, `ec2messages` if it's in a private subnet with no NAT) |
 | `AccessDeniedException` on `ssm:SendCommand` in the workflow log | IAM user policy's resource ARNs don't match your actual region/account/instance ID | Re-check the ARNs in §5 character-for-character against `$REGION`, `$ACCOUNT_ID`, `$EC2_INSTANCE_ID` |
 | SSM command fails with "not a git clone yet" | `$EC2_APP_DIR` exists but isn't a git repository | Follow §3B to convert it in place |
@@ -333,5 +359,5 @@ Manual, the simplest way if you still have your own SSH access to the box: `ssh`
   ```
 - To fully revoke CI's AWS access at any time: `aws iam delete-access-key` (keeps the user, immediate effect) or `aws iam delete-user` (after removing its policy and keys).
 - A stronger long-term option is **GitHub OIDC federation** (`aws-actions/configure-aws-credentials` with `role-to-assume`, no stored keys at all — GitHub and AWS exchange a short-lived token per run). It removes the "long-lived secret sitting in GitHub" risk entirely. This guide uses a plain IAM user because that's what was asked for; OIDC is a drop-in upgrade later if you want it.
-- The IAM user's policy is scoped to exactly one instance ARN and one SSM document — even if the access keys leaked, the blast radius is limited to sending shell commands to this one EC2 instance, not your whole AWS account.
+- The IAM user's policy scopes the two meaningful write actions (`ssm:SendCommand`, `ec2:StartInstances`) to exactly one instance ARN. The read-only describe actions (`ec2:DescribeInstances`, `ec2:DescribeInstanceStatus`, `ssm:DescribeInstanceInformation`, `ssm:ListCommandInvocations`) require `Resource: "*"` by AWS's own design — they can list/describe things account-wide, but can't change or access the content of anything outside this one instance. Even if the access keys leaked, the blast radius is "send shell commands to this one EC2 instance, start it if stopped, and see what else is running" — not modify, stop, terminate, or read data from anything else in your account.
 - The EC2 instance role has exactly one AWS-managed policy (`AmazonSSMManagedInstanceCore`) — it cannot read or write anything else in your AWS account either.
